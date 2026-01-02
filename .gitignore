@@ -6,3 +6,6 @@ __pycache__/
 *.log
 tmp/
 outputs/
+
+# Private fixtures (do not commit)
+tests/fixtures_private/
