@@ -1,14 +1,15 @@
 {
   "chassi": "9BD2651MHM9185242",
   "comprador_cpf_cnpj": "41100508656",
-  "comprador_nome": "NUMERO CRV CODIGO DE SEGURANCA CRV",
+  "comprador_nome": "MARIA ODETE FERREIRA REBELLO",
   "data_venda": "01/10/2025",
   "debug": {
     "min_text_len_threshold": 800,
-    "missing_required": [
-      "uf"
-    ],
     "mode": "ocr",
+    "mode_decision": {
+      "chosen": "ocr",
+      "reason": "image_input"
+    },
     "native_text_len": 0,
     "ocr_text_len": 1514,
     "pages": [
@@ -18,11 +19,11 @@
       }
     ]
   },
-  "municipio": "DE DOMICILIO OU RESIDENCIA UR",
+  "municipio": "SENATRAN\n\nDETRAN",
   "placa": "RMW8F32",
   "renavam": "01262046804",
-  "uf": null,
+  "uf": "SC",
   "valor_venda": "65.000,00",
-  "vendedor_cpf_cnpj": "02934143945",
-  "vendedor_nome": "MUNICIPIO DE DOMICILIO OU RESIDENCIA UR"
+  "vendedor_cpf_cnpj": "01262046804",
+  "vendedor_nome": "MARIA ODETE FERREIRA REBELLO"
 }
