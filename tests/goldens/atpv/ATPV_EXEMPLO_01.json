@@ -1,0 +1,36 @@
+{
+  "chassi": null,
+  "comprador_cpf_cnpj": null,
+  "comprador_nome": "O REGISTRO DESTE VEICULO PARA O COMPRADOR ACIMA IDEN FICADO",
+  "data_venda": null,
+  "debug": {
+    "min_text_len_threshold": 800,
+    "missing_required": [
+      "placa",
+      "renavam",
+      "chassi",
+      "vendedor_nome",
+      "vendedor_cpf_cnpj",
+      "comprador_cpf_cnpj",
+      "data_venda",
+      "uf",
+      "valor_venda"
+    ],
+    "mode": "native",
+    "native_text_len": 1711,
+    "ocr_text_len": 0,
+    "pages": [
+      {
+        "native_len": 1711,
+        "page": 1
+      }
+    ]
+  },
+  "municipio": "DE DOMICILIO OU RESIDENCIA UF",
+  "placa": null,
+  "renavam": null,
+  "uf": null,
+  "valor_venda": null,
+  "vendedor_cpf_cnpj": null,
+  "vendedor_nome": null
+}

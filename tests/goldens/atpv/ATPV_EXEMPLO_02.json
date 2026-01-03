@@ -1,0 +1,28 @@
+{
+  "chassi": "9BD2651MHM9185242",
+  "comprador_cpf_cnpj": "41100508656",
+  "comprador_nome": "NUMERO CRV CODIGO DE SEGURANCA CRV",
+  "data_venda": "01/10/2025",
+  "debug": {
+    "min_text_len_threshold": 800,
+    "missing_required": [
+      "uf"
+    ],
+    "mode": "ocr",
+    "native_text_len": 0,
+    "ocr_text_len": 1514,
+    "pages": [
+      {
+        "ocr_len": 1514,
+        "page": 1
+      }
+    ]
+  },
+  "municipio": "DE DOMICILIO OU RESIDENCIA UR",
+  "placa": "RMW8F32",
+  "renavam": "01262046804",
+  "uf": null,
+  "valor_venda": "65.000,00",
+  "vendedor_cpf_cnpj": "02934143945",
+  "vendedor_nome": "MUNICIPIO DE DOMICILIO OU RESIDENCIA UR"
+}
