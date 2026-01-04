@@ -1,18 +1,17 @@
-# parsers/atpv.py
 from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-MIN_NATIVE_TEXT_LEN = 800
+import pdfplumber
 
 
-# =============================================================================
-# Data model
-# =============================================================================
+# ==========================
+# Result model
+# ==========================
 
 @dataclass
 class AtpvResult:
@@ -31,399 +30,424 @@ class AtpvResult:
     uf: Optional[str] = None
     valor_venda: Optional[str] = None
 
-    debug: Optional[Dict[str, Any]] = None
+    debug: Dict[str, Any] = None  # type: ignore
 
 
-# =============================================================================
-# API pública
-# =============================================================================
+# ==========================
+# Public API
+# ==========================
 
-def analyze_atpv(path: str | Path, *, strict: bool = True) -> Dict[str, Any]:
-    p = Path(path)
-    if not p.exists():
-        raise FileNotFoundError(p)
+def analyze_atpv(
+    file_path: Path,
+    *,
+    min_text_len_threshold: int = 800,
+    ocr_dpi: int = 300,
+    strict: bool | None = None,
+) -> Dict[str, Any]:
+    """
+    Retorna dict compatível com golden tests.
 
-    mode, native_text, ocr_text, pages, decision = _extract_text_hybrid(p)
-    base_text = native_text if mode == "native" else ocr_text
-    norm = _normalize(base_text)
+    Regras:
+    - Por padrão, ATPV NÃO é estrito (fase de bootstrap)
+    - strict=True força validação de campos obrigatórios
+    - strict=False ignora obrigatórios
+    """
+    file_path = Path(file_path)
 
-    debug = {
-        "mode": mode,
-        "native_text_len": len(native_text),
-        "ocr_text_len": len(ocr_text),
-        "pages": pages,
-        "min_text_len_threshold": MIN_NATIVE_TEXT_LEN,
-        "mode_decision": decision,  # explica por que escolheu native/ocr
+    if strict is None:
+        strict = False
+
+    debug: Dict[str, Any] = {
+        "mode": None,
+        "native_text_len": 0,
+        "ocr_text_len": 0,
+        "min_text_len_threshold": min_text_len_threshold,
+        "pages": [],
+        "missing_required": [],
     }
 
-    r = AtpvResult(debug=debug)
+    if file_path.suffix.lower() == ".pdf":
+        native_text, pages = _extract_pdf_native_text(file_path)
+        debug["native_text_len"] = len(native_text)
+        debug["pages"] = pages
 
-    if mode == "native":
-        _parse_native(norm, r)
+        if len(native_text) >= min_text_len_threshold:
+            debug["mode"] = "native"
+            r = _parse_atpv_text(native_text, debug=debug)
+        else:
+            ocr_text, pages_ocr = _extract_pdf_ocr_text(file_path, dpi=ocr_dpi)
+            debug["mode"] = "ocr"
+            debug["ocr_text_len"] = len(ocr_text)
+            debug["pages"] = pages_ocr
+            r = _parse_atpv_text(ocr_text, debug=debug)
     else:
-        _parse_ocr(norm, r)
+        ocr_text, pages_ocr = _extract_image_ocr_text(file_path)
+        debug["mode"] = "ocr"
+        debug["ocr_text_len"] = len(ocr_text)
+        debug["pages"] = pages_ocr
+        r = _parse_atpv_text(ocr_text, debug=debug)
 
-    missing = _enforce_required_fields(r, strict=strict)
-    if missing:
-        r.debug["missing_required"] = missing
+    r.debug = debug
+
+    if strict:
+        _enforce_required_fields(r)
+    else:
+        debug["missing_required"] = _missing_required_fields(r)
 
     return asdict(r)
 
 
-# =============================================================================
-# Extração híbrida (PDF nativo vs OCR) com checagem de qualidade
-# =============================================================================
+# ==========================
+# Text extraction
+# ==========================
 
-def _extract_text_hybrid(path: Path) -> Tuple[str, str, str, List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Retorna:
-      (mode, native_text, ocr_text, pages_debug, decision_debug)
-    """
-    decision: Dict[str, Any] = {}
-    suffix = path.suffix.lower()
+def _extract_pdf_native_text(pdf_path: Path) -> Tuple[str, List[Dict[str, Any]]]:
+    pages_dbg: List[Dict[str, Any]] = []
+    chunks: List[str] = []
 
-    if suffix == ".pdf":
-        native_text, native_pages = _extract_pdf_native_text(path)
-        decision["native_len"] = len(native_text)
-        decision["native_quality_ok"] = _native_text_quality_ok(native_text)
-
-        # Critério híbrido:
-        # - se texto nativo curto -> OCR
-        # - se texto nativo longo mas "lixo" -> OCR
-        # - só usa native se for longo E de qualidade aceitável
-        if len(native_text) >= MIN_NATIVE_TEXT_LEN and decision["native_quality_ok"]:
-            decision["chosen"] = "native"
-            decision["reason"] = "native_len>=threshold and native_quality_ok"
-            return "native", native_text, "", native_pages, decision
-
-        # fallback OCR
-        ocr_text, ocr_pages = _extract_pdf_ocr_text(path)
-        decision["chosen"] = "ocr"
-        if len(native_text) < MIN_NATIVE_TEXT_LEN:
-            decision["reason"] = "native_len<threshold"
-        else:
-            decision["reason"] = "native_quality_bad_forced_ocr"
-        return "ocr", native_text, ocr_text, ocr_pages, decision
-
-    # Imagem: sempre OCR
-    ocr_text, ocr_pages = _extract_image_ocr_text(path)
-    decision["chosen"] = "ocr"
-    decision["reason"] = "image_input"
-    return "ocr", "", ocr_text, ocr_pages, decision
-
-
-def _native_text_quality_ok(text: str) -> bool:
-    """
-    Heurística para detectar 'texto nativo lixo':
-    - muito token de 1 caractere
-    - poucas palavras de tamanho >= 3
-    - aparência de texto 'desmontado' (muitas letras isoladas)
-    """
-    if not text:
-        return False
-
-    # Normaliza para analisar
-    t = _strip_accents(text).upper()
-    # Tokens por whitespace
-    toks = [x for x in re.split(r"\s+", t) if x]
-    if len(toks) < 30:
-        # pouco texto: não confiável
-        return False
-
-    one_char = sum(1 for x in toks if len(x) == 1)
-    longish = sum(1 for x in toks if len(x) >= 3)
-
-    one_char_ratio = one_char / max(1, len(toks))
-    longish_ratio = longish / max(1, len(toks))
-
-    # Outra heurística: quantos tokens parecem "só letras isoladas" (A, B, C, ...)
-    alpha_one_char = sum(1 for x in toks if len(x) == 1 and x.isalpha())
-    alpha_one_char_ratio = alpha_one_char / max(1, len(toks))
-
-    # Limiares calibrados para o seu caso (texto cheio de caracteres soltos)
-    # - se > 35% tokens de 1 char, quase certamente lixo
-    # - se < 18% tokens >= 3 chars, quase certamente lixo
-    # - se muitos 1-char alfabéticos, sinal forte de desmontado
-    if one_char_ratio > 0.35:
-        return False
-    if longish_ratio < 0.18:
-        return False
-    if alpha_one_char_ratio > 0.20:
-        return False
-
-    return True
-
-
-def _extract_pdf_native_text(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
-    try:
-        import pdfplumber  # type: ignore
-    except ImportError as e:
-        raise RuntimeError("pdfplumber não instalado") from e
-
-    texts: List[str] = []
-    pages: List[Dict[str, Any]] = []
-
-    with pdfplumber.open(str(path)) as pdf:
+    with pdfplumber.open(str(pdf_path)) as pdf:
         for i, page in enumerate(pdf.pages):
             txt = page.extract_text() or ""
-            texts.append(txt)
-            pages.append({"page": i + 1, "native_len": len(txt)})
+            pages_dbg.append({"page": i + 1, "native_len": len(txt)})
+            chunks.append(txt)
 
-    return "\n".join(texts), pages
-
-
-def _extract_pdf_ocr_text(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
-    try:
-        from pdf2image import convert_from_path  # type: ignore
-        import pytesseract  # type: ignore
-    except ImportError as e:
-        raise RuntimeError("pdf2image / pytesseract não instalado") from e
-
-    texts: List[str] = []
-    pages: List[Dict[str, Any]] = []
-
-    images = convert_from_path(str(path), dpi=300)
-    for i, img in enumerate(images):
-        txt = pytesseract.image_to_string(img, lang="por") or ""
-        texts.append(txt)
-        pages.append({"page": i + 1, "ocr_len": len(txt)})
-
-    return "\n".join(texts), pages
+    return "\n".join(chunks), pages_dbg
 
 
-def _extract_image_ocr_text(path: Path) -> Tuple[str, List[Dict[str, Any]]]:
-    try:
-        from PIL import Image  # type: ignore
-        import pytesseract  # type: ignore
-    except ImportError as e:
-        raise RuntimeError("Pillow / pytesseract não instalado") from e
+def _extract_pdf_ocr_text(pdf_path: Path, *, dpi: int) -> Tuple[str, List[Dict[str, Any]]]:
+    import pytesseract  # type: ignore
 
-    img = Image.open(str(path))
-    txt = pytesseract.image_to_string(img, lang="por") or ""
+    pages_dbg: List[Dict[str, Any]] = []
+    chunks: List[str] = []
+
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for i, page in enumerate(pdf.pages):
+            im = page.to_image(resolution=dpi).original
+            txt = pytesseract.image_to_string(im, lang="por")
+            pages_dbg.append({"page": i + 1, "ocr_len": len(txt)})
+            chunks.append(txt)
+
+    return "\n".join(chunks), pages_dbg
+
+
+def _extract_image_ocr_text(img_path: Path) -> Tuple[str, List[Dict[str, Any]]]:
+    import pytesseract  # type: ignore
+    from PIL import Image  # type: ignore
+
+    im = Image.open(str(img_path))
+    txt = pytesseract.image_to_string(im, lang="por")
     return txt, [{"page": 1, "ocr_len": len(txt)}]
 
 
-# =============================================================================
-# Native PDF parsing (mantido; só será usado quando native_quality_ok=True)
-# =============================================================================
+# ==========================
+# Parsing helpers
+# ==========================
 
-def _parse_native(text: str, r: AtpvResult) -> None:
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    upper = [l.upper() for l in lines]
+_RE_PLACA_ANTIGA = re.compile(r"\b[A-Z]{3}\d{4}\b")
+_RE_PLACA_MERCOSUL = re.compile(r"\b[A-Z]{3}\d[A-Z0-9]\d{2}\b")
+_RE_RENAVAM = re.compile(r"\b\d{9,11}\b")
+_RE_CHASSI = re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b")
 
-    def after(label: str) -> Optional[str]:
-        for i, l in enumerate(upper):
-            if label in l and i + 1 < len(lines):
-                return lines[i + 1]
-        return None
+_RE_UF = re.compile(r"\b[A-Z]{2}\b")
 
-    r.placa = after("PLACA")
-    r.renavam = after("RENAVAM")
-    r.chassi = _find_vin(lines)
-    r.data_venda = after("DATA DECLARADA DA VENDA")
-    r.valor_venda = _regex(text, r"VALOR\s+DECLARADO\s+NA\s+VENDA:\s*R\$\s*([0-9\.\s]+,[0-9]{2})")
+# data flexível (OCR): 01/10/2025, 01 / 10 / 2025, 01-10-2025
+_RE_DATA_FLEX = re.compile(r"\b(\d{2})\s*[\/\-]\s*(\d{2})\s*[\/\-]\s*(\d{4})\b")
 
-    _parse_partes_native(lines, r)
+_RE_VALOR = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
 
 
-def _parse_partes_native(lines: List[str], r: AtpvResult) -> None:
-    def block(title: str) -> List[str]:
-        for i, l in enumerate(lines):
-            if title in l.upper():
-                return lines[i:i + 18]
-        return []
-
-    comp = block("IDENTIFICAÇÃO DO COMPRADOR")
-    vend = block("IDENTIFICAÇÃO DO VENDEDOR")
-
-    r.comprador_nome = _after_in_block(comp, "NOME")
-    r.comprador_cpf_cnpj = _first_doc(comp)
-
-    r.vendedor_nome = _after_in_block(vend, "NOME")
-    r.vendedor_cpf_cnpj = _first_doc(vend)
-
-    mun, uf = _municipio_uf_from_block(comp)
-    if not (mun or uf):
-        mun, uf = _municipio_uf_from_block(vend)
-    r.municipio, r.uf = mun, uf
-
-
-# =============================================================================
-# OCR parsing (é aqui que o PDF do exemplo vai cair após a correção)
-# =============================================================================
-
-_UF_ALL = r"(AC|AL|AP|AM|BA|CE|DF|ES|GO|MA|MT|MS|MG|PA|PB|PR|PE|PI|RJ|RN|RS|RO|RR|SC|SP|SE|TO)"
-
-
-def _parse_ocr(text: str, r: AtpvResult) -> None:
-    u = _strip_accents(text).upper()
-
-    # Placa
-    r.placa = _regex(u, r"\b([A-Z]{3}\d[A-Z0-9]\d{2})\b") or _regex(u, r"\b([A-Z]{3}\d{4})\b")
-
-    # Renavam (normalmente vem como 11 dígitos)
-    ren = _regex(u, r"\bRENAVAM\b\s*[:\-]?\s*([0-9\.\-\s]{9,15})")
-    if ren:
-        ren_d = _only_digits(ren)
-        if 9 <= len(ren_d) <= 11:
-            r.renavam = ren_d
-    if not r.renavam:
-        cand = re.search(r"\b(\d{11})\b", u)
-        r.renavam = cand.group(1) if cand else None
-
-    # Chassi (VIN)
-    r.chassi = _regex(u, r"\b([A-HJ-NPR-Z0-9]{17})\b")
-
-    # Data venda
-    r.data_venda = _regex(u, r"\b([0-3]?\d/[01]?\d/\d{4})\b")
-
-    # Valor venda (preferir o "Valor declarado na venda")
-    r.valor_venda = (
-        _regex(u, r"VALOR\s+DECLARADO\s+NA\s+VENDA\s*:\s*R\$\s*([0-9\.\s]+,[0-9]{2})")
-        or _regex(u, r"R\$\s*([0-9\.\s]+,[0-9]{2})")
-    )
-    if r.valor_venda:
-        r.valor_venda = r.valor_venda.replace(" ", "")
-
-    # Documentos: pega os dois primeiros (vendedor, comprador) — melhora depois quando tivermos OCR do PDF
-    docs = re.findall(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", u)
-    if len(docs) >= 2:
-        r.vendedor_cpf_cnpj = _only_digits(docs[0])
-        r.comprador_cpf_cnpj = _only_digits(docs[1])
-
-    # Nomes (mínimo viável; refinamos com OCR do PDF)
-    r.vendedor_nome = _extract_nome_after_section(u, "IDENTIFICACAO DO VENDEDOR")
-    r.comprador_nome = _extract_nome_after_section(u, "IDENTIFICACAO DO COMPRADOR")
-
-    # Município/UF
-    r.municipio, r.uf = _extract_municipio_uf(u)
-
-
-def _extract_nome_after_section(u: str, section: str) -> Optional[str]:
-    """
-    No OCR, costuma existir:
-      IDENTIFICAÇÃO DO VENDEDOR
-      NOME
-      <nome...>
-    então buscamos o valor imediatamente após 'NOME' dentro de uma janela.
-    """
-    idx = u.find(section)
-    if idx < 0:
-        return None
-    window = u[idx: idx + 600]
-
-    # padrão: NOME \n <NOME>
-    m = re.search(r"\bNOME\b\s*\n?\s*([A-Z][A-Z ]{5,})", window)
-    if m:
-        name = re.sub(r"\s+", " ", m.group(1)).strip()
-        # corta se vier juntando outro rótulo
-        name = re.split(r"\b(CPF|CNPJ|E-MAIL|EMAIL|MUNICIPIO|ENDERECO|ASSINATURA)\b", name)[0].strip()
-        return name or None
-    return None
-
-
-def _extract_municipio_uf(text_upper: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    OCR típico:
-      MUNICIPIO DE DOMICILIO OU RESIDENCIA UF
-      PORTO BELO - SC
-    ou
-      DETRAN - sc
-    """
-    t = text_upper
-
-    # caso "CIDADE - UF" ou "CIDADE/UF"
-    m = re.search(r"\b([A-Z]{3,}(?:\s+[A-Z]{2,})*)\s*[-/]\s*%s\b" % _UF_ALL, t)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-
-    # UF: XX
-    m = re.search(r"\bUF\b\s*[:\-]?\s*(%s)\b" % _UF_ALL, t)
-    uf = m.group(1).strip() if m else None
-
-    # tenta achar qualquer ocorrência de UF no doc (ex.: "DETRAN - SC")
-    if not uf:
-        m = re.search(r"[-/]\s*(%s)\b" % _UF_ALL, t)
-        uf = m.group(1).strip() if m else None
-
-    # Município: tenta extrair uma linha pós "MUNICIPIO ..."
-    m = re.search(r"\bMUNICIPIO\b.*?\bRESIDENCIA\b.*?\bUF\b", t)
-    if m:
-        # janela após o rótulo (OCR costuma colocar o valor na linha seguinte)
-        tail = t[m.end(): m.end() + 300]
-        m2 = re.search(r"\b([A-Z]{3,}(?:\s+[A-Z]{2,})*)\s*[-/]\s*(%s)\b" % _UF_ALL, tail)
-        if m2:
-            return m2.group(1).strip(), m2.group(2).strip()
-
-        # se não achou cidade, pelo menos mantém UF (se tiver)
-        return None, uf
-
-    return None, uf
-
-
-# =============================================================================
-# Helpers gerais
-# =============================================================================
-
-def _regex(text: str, pat: str, flags=0) -> Optional[str]:
-    m = re.search(pat, text, flags)
-    return m.group(1).strip() if m else None
-
-
-def _find_vin(lines: List[str]) -> Optional[str]:
-    for l in lines:
-        m = re.search(r"\b([A-HJ-NPR-Z0-9]{17})\b", l)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _after_in_block(block: List[str], label: str) -> Optional[str]:
-    for i, l in enumerate(block):
-        if label in l.upper() and i + 1 < len(block):
-            return block[i + 1]
-    return None
-
-
-def _first_doc(block: List[str]) -> Optional[str]:
-    for l in block:
-        d = _only_digits(l)
-        if len(d) in (11, 14):
-            return d
-    return None
-
-
-def _municipio_uf_from_block(block: List[str]) -> Tuple[Optional[str], Optional[str]]:
-    for i, l in enumerate(block):
-        if "MUNIC" in l.upper() and i + 1 < len(block):
-            parts = block[i + 1].split()
-            if len(parts) >= 2:
-                maybe_uf = parts[-1].upper()
-                if re.fullmatch(_UF_ALL, maybe_uf):
-                    return " ".join(parts[:-1]), maybe_uf
-    return None, None
-
-
-def _only_digits(s: str) -> str:
-    return re.sub(r"\D+", "", s or "")
+def _normalize_text(t: str) -> str:
+    t = t.upper()
+    t = t.replace("‐", "-").replace("–", "-").replace("—", "-")
+    t = re.sub(r"[ \t]+", " ", t)
+    return t
 
 
 def _strip_accents(s: str) -> str:
     nfkd = unicodedata.normalize("NFKD", s)
-    return "".join([c for c in nfkd if not unicodedata.combining(c)])
+    return "".join(c for c in nfkd if not unicodedata.combining(c))
 
 
-def _normalize(t: str) -> str:
-    # mantém quebras de linha para OCR/native parsing por blocos
-    t = t.replace("\u00a0", " ")
-    t = unicodedata.normalize("NFKC", t)
-    t = re.sub(r"[ \t]+", " ", t)
-    t = re.sub(r"\n{3,}", "\n\n", t)
-    return t
+def _only_digits(s: str) -> str:
+    return re.sub(r"\D+", "", s)
 
 
-def _enforce_required_fields(r: AtpvResult, *, strict: bool) -> List[str]:
-    fields = [
+def _find_first(pattern: re.Pattern, text: str) -> Optional[str]:
+    m = pattern.search(text)
+    return m.group(0) if m else None
+
+
+def _format_date_from_match(m: re.Match) -> str:
+    dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
+    return f"{dd}/{mm}/{yyyy}"
+
+
+def _find_anchor_index(text: str, anchors: List[str]) -> int:
+    """
+    Procura âncoras de forma tolerante:
+    - remove acentos para comparação
+    - trabalha em uppercase
+    Retorna índice no texto normalizado.
+    """
+    t_norm = _normalize_text(text)
+    t_key = _strip_accents(t_norm)
+
+    for a in anchors:
+        a_key = _strip_accents(_normalize_text(a))
+        idx = t_key.find(a_key)
+        if idx >= 0:
+            return idx
+    return -1
+
+
+def _extract_data_venda(text: str) -> Optional[str]:
+    t = _normalize_text(text)
+    anchors = [
+        "DATA DECLARADA DA VENDA",
+        "DATA DECLARADA",
+        "DATA DA VENDA",
+    ]
+    idx = _find_anchor_index(t, anchors)
+    if idx >= 0:
+        window = t[idx : idx + 250]
+        m = _RE_DATA_FLEX.search(window)
+        if m:
+            return _format_date_from_match(m)
+
+    m2 = _RE_DATA_FLEX.search(t)
+    if m2:
+        return _format_date_from_match(m2)
+
+    return None
+
+
+def _extract_section(text: str, start_anchor: str, end_anchor: str) -> str:
+    t = _normalize_text(text)
+    s = t.find(start_anchor)
+    if s < 0:
+        return ""
+    e = t.find(end_anchor, s + len(start_anchor))
+    if e < 0:
+        return t[s:]
+    return t[s:e]
+
+
+# --------------------------
+# UF / Município robustos
+# --------------------------
+
+# UFs válidas no Brasil (para não aceitar "CR", "BR", etc.)
+_UF_VALIDAS = {
+    "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT",
+    "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO",
+}
+
+# tokens que são claramente labels e não município
+_MUNICIPIO_BAD_TOKENS = {
+    "MUNICIPIO", "MUNICÍPIO", "DE", "DOMICILIO", "DOMICÍLIO", "OU", "RESIDENCIA", "RESIDÊNCIA",
+    "UF", "ENDERECO", "ENDEREÇO", "DO", "DA", "DOS", "DAS",
+}
+
+_PREPOSICOES_2L = {"DE", "DA", "DO", "EM"}
+
+
+def _sanitize_municipio_tokens(tokens: List[str]) -> List[str]:
+    """
+    Remove sujeiras comuns no início do município (OCR).
+    Ex: 'UR PORTO BELO' -> 'PORTO BELO'
+    Regra: se primeiro token tem 2 letras e NÃO é UF válida e NÃO é preposição, remove.
+    Também remove explicitamente UR/UF.
+    """
+    if not tokens:
+        return tokens
+
+    # remove UR/UF explícitos no começo
+    while tokens and tokens[0] in {"UR", "UF"}:
+        tokens = tokens[1:]
+
+    if len(tokens) >= 2 and len(tokens[0]) == 2:
+        t0 = tokens[0]
+        if (t0 not in _UF_VALIDAS) and (t0 not in _PREPOSICOES_2L):
+            tokens = tokens[1:]
+
+    return tokens
+
+
+def _extract_municipio_uf_from_anchor(text: str) -> Optional[Tuple[str, str]]:
+    """
+    Extrai município/UF preferindo âncora completa:
+    'MUNICÍPIO DE DOMICÍLIO OU RESIDÊNCIA UF'
+    e pegando a janela logo depois, que é onde os dados aparecem no ATPV-e.
+    """
+    t = _normalize_text(text)
+
+    anchors = [
+        "MUNICÍPIO DE DOMICÍLIO OU RESIDÊNCIA UF",
+        "MUNICIPIO DE DOMICILIO OU RESIDENCIA UF",
+        "MUNICÍPIO DE DOMICÍLIO OU RESIDÊNCIA",
+        "MUNICIPIO DE DOMICILIO OU RESIDENCIA",
+    ]
+    idx = _find_anchor_index(t, anchors)
+    if idx < 0:
+        return None
+
+    window = t[idx : idx + 260]
+
+    ufs = [uf for uf in _RE_UF.findall(window) if uf in _UF_VALIDAS]
+    if not ufs:
+        return None
+
+    uf = ufs[0]
+
+    before = window[: window.find(uf)].strip()
+    before = re.sub(r"[^A-ZÁÉÍÓÚÂÊÔÃÕÇ ]", " ", before)
+    before = re.sub(r"\s+", " ", before).strip()
+
+    parts = [p for p in before.split() if p not in _MUNICIPIO_BAD_TOKENS]
+    parts = _sanitize_municipio_tokens(parts)
+
+    municipio = " ".join(parts).strip()
+    if len(municipio) < 3:
+        return None
+
+    return municipio, uf
+
+
+def _extract_municipio_uf_fallback(text: str) -> Optional[Tuple[str, str]]:
+    t = _normalize_text(text)
+
+    for m in _RE_UF.finditer(t):
+        uf = m.group(0)
+        if uf not in _UF_VALIDAS:
+            continue
+
+        start = max(0, m.start() - 80)
+        snippet = t[start:m.start()].strip()
+
+        snippet = re.sub(r"[^A-ZÁÉÍÓÚÂÊÔÃÕÇ ]", " ", snippet)
+        snippet = re.sub(r"\s+", " ", snippet).strip()
+
+        parts = [p for p in snippet.split() if p not in _MUNICIPIO_BAD_TOKENS]
+        parts = _sanitize_municipio_tokens(parts)
+
+        municipio = " ".join(parts).strip()
+
+        if len(municipio.split()) > 6:
+            municipio = " ".join(municipio.split()[-6:])
+
+        if len(municipio) >= 3:
+            return municipio, uf
+
+    return None
+
+
+def _extract_municipio_uf(text: str) -> Optional[Tuple[str, str]]:
+    got = _extract_municipio_uf_from_anchor(text)
+    if got:
+        return got
+    return _extract_municipio_uf_fallback(text)
+
+
+# --------------------------
+# Main parse
+# --------------------------
+
+def _parse_atpv_text(text: str, *, debug: Dict[str, Any]) -> AtpvResult:
+    t = _normalize_text(text)
+
+    vendedor_block = _extract_section(t, "IDENTIFICAÇÃO DO VENDEDOR", "IDENTIFICAÇÃO DO COMPRADOR")
+    comprador_block = _extract_section(t, "IDENTIFICAÇÃO DO COMPRADOR", "MENSAGENS SENATRAN")
+
+    r = AtpvResult(debug=debug)
+
+    r.placa = _find_first(_RE_PLACA_MERCOSUL, t) or _find_first(_RE_PLACA_ANTIGA, t)
+    r.renavam = _find_first(_RE_RENAVAM, t)
+    r.chassi = _find_first(_RE_CHASSI, t)
+    r.valor_venda = _find_first(_RE_VALOR, t)
+
+    r.data_venda = _extract_data_venda(t)
+
+    mun_uf = _extract_municipio_uf(vendedor_block) or _extract_municipio_uf(t)
+    if mun_uf:
+        r.municipio, r.uf = mun_uf
+
+    r.vendedor_cpf_cnpj = _extract_cpf_cnpj(vendedor_block)
+    r.vendedor_nome = _extract_nome_pos_label(vendedor_block, "NOME")
+
+    r.comprador_cpf_cnpj = _extract_cpf_cnpj(comprador_block)
+    r.comprador_nome = _extract_nome_pos_label(comprador_block, "NOME")
+
+    if r.vendedor_cpf_cnpj:
+        r.vendedor_cpf_cnpj = _only_digits(r.vendedor_cpf_cnpj)
+    if r.comprador_cpf_cnpj:
+        r.comprador_cpf_cnpj = _only_digits(r.comprador_cpf_cnpj)
+
+    r.vendedor_nome = _clean_nome(r.vendedor_nome)
+    r.comprador_nome = _clean_nome(r.comprador_nome)
+
+    return r
+
+
+def _extract_cpf_cnpj(block: str) -> Optional[str]:
+    m = re.search(r"\b\d{11,14}\b", _only_digits(block))
+    return m.group(0) if m else None
+
+
+def _extract_nome_pos_label(block: str, label: str) -> Optional[str]:
+    b = _normalize_text(block)
+    idx = b.find(label)
+    if idx < 0:
+        return None
+
+    window = b[idx + len(label) : idx + 220]
+    stop_tokens = [
+        "CPF", "CNPJ", "E-MAIL", "EMAIL", "PLACA", "RENAVAM", "CHASSI",
+        "MUNICIPIO", "MUNICÍPIO", "UF", "ENDERECO", "ENDEREÇO",
+        "DATA", "VALOR", "ANO",
+    ]
+    for st in stop_tokens:
+        p = window.find(st)
+        if p > 0:
+            window = window[:p].strip()
+
+    window = re.sub(r"[^A-ZÁÉÍÓÚÂÊÔÃÕÇ ]", " ", window)
+    window = re.sub(r"\s+", " ", window).strip()
+
+    if len(window.split()) < 2:
+        return None
+
+    return window
+
+
+def _clean_nome(nome: Optional[str]) -> Optional[str]:
+    if not nome:
+        return None
+    n = _normalize_text(nome)
+
+    bad = [
+        "IDENTIFICACAO", "IDENTIFICAÇÃO",
+        "MUNICIPIO", "MUNICÍPIO",
+        "ASSINATURA", "AUTENTICACAO", "AUTENTICAÇÃO",
+        "MENSAGENS", "SENATRAN",
+        "NUMERO", "CÓDIGO", "CODIGO",
+        "ENDERECO", "ENDEREÇO",
+    ]
+    for b in bad:
+        if b in n:
+            return None
+
+    if len(n.split()) < 2:
+        return None
+
+    return n
+
+
+# ==========================
+# Required fields
+# ==========================
+
+def _missing_required_fields(r: AtpvResult) -> List[str]:
+    required = [
         ("placa", r.placa),
         ("renavam", r.renavam),
         ("chassi", r.chassi),
@@ -436,10 +460,14 @@ def _enforce_required_fields(r: AtpvResult, *, strict: bool) -> List[str]:
         ("uf", r.uf),
         ("valor_venda", r.valor_venda),
     ]
-
-    missing = [k for k, v in fields if v is None or (isinstance(v, str) and not v.strip())]
-
-    if missing and strict:
-        raise ValueError(f"ATPV: campos obrigatórios ausentes: {missing}")
-
+    missing: List[str] = []
+    for k, v in required:
+        if v is None or (isinstance(v, str) and not v.strip()):
+            missing.append(k)
     return missing
+
+
+def _enforce_required_fields(r: AtpvResult) -> None:
+    missing = _missing_required_fields(r)
+    if missing:
+        raise ValueError(f"ATPV: campos obrigatórios ausentes: {missing}")
