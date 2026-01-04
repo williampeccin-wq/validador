@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -87,6 +88,14 @@ def _as_int(v: Any, default: int = 0) -> int:
         return default
 
 
+def _only_digits(s: str) -> str:
+    return re.sub(r"\D+", "", s)
+
+
+def _has_double_space(s: str) -> bool:
+    return "  " in s
+
+
 def _is_jpeg_like(fixture_path: Path, out: Dict[str, Any]) -> bool:
     """
     Heurística para identificar casos "JPEG-like" (imagem/scan), onde faz sentido
@@ -141,21 +150,107 @@ def test_atpv_golden(fixture_path: Path, golden_path: Path) -> None:
     expected = _read_json(golden_path)
     assert out == expected
 
-    # ===========================
-    # Passo 2 — asserts adicionais
-    # ===========================
+    # ============================================================
+    # Passo 4 — invariantes de contrato (shape + sanidade mínima)
+    # ============================================================
+
+    REQUIRED_KEYS = {
+        "chassi",
+        "comprador_cpf_cnpj",
+        "comprador_nome",
+        "data_venda",
+        "debug",
+        "municipio",
+        "placa",
+        "renavam",
+        "uf",
+        "valor_venda",
+        "vendedor_cpf_cnpj",
+        "vendedor_nome",
+    }
+    assert set(out.keys()) == REQUIRED_KEYS, f"Contrato mudou. Keys: {sorted(out.keys())}"
+
+    # Tipos (permitimos None/"" em campos textuais; debug deve ser dict)
+    assert isinstance(out["debug"], dict), "debug deve ser dict"
+
+    for k in REQUIRED_KEYS - {"debug"}:
+        assert (out[k] is None) or isinstance(out[k], str), f"{k} deve ser str ou None (veio {type(out[k]).__name__})"
+
+    # Campos com strip implícito (se houver valor)
+    for k in REQUIRED_KEYS - {"debug"}:
+        v = out.get(k)
+        if isinstance(v, str) and v != "":
+            assert v == v.strip(), f"{k} não deve ter espaços nas bordas: {v!r}"
+
+    # Nomes/município: evitar duplo espaço (indicador de pós-processamento ruim)
+    for k in ("vendedor_nome", "comprador_nome", "municipio"):
+        v = out.get(k)
+        if isinstance(v, str) and v.strip():
+            assert not _has_double_space(v), f"{k} não deve conter duplo espaço: {v!r}"
+
+    # CPF/CNPJ: se presente, apenas dígitos e tamanho 11/14
+    for k in ("vendedor_cpf_cnpj", "comprador_cpf_cnpj"):
+        v = out.get(k)
+        if isinstance(v, str) and v.strip():
+            digits = _only_digits(v)
+            assert digits == v, f"{k} deve conter apenas dígitos (sem pontuação): {v!r}"
+            assert len(digits) in (11, 14), f"{k} deve ter 11 (CPF) ou 14 (CNPJ) dígitos: {v!r}"
+
+    # UF: sempre válida
+    uf = (out.get("uf") or "").strip().upper()
+    assert uf, "uf não pode ser nula/vazia"
+    assert uf in UF_BR_VALIDAS, f"uf inválida: {uf!r}"
+
+    # Município saneado (não começar com 'UR ')
+    municipio = (out.get("municipio") or "").strip()
+    assert municipio, "municipio não pode ser nulo/vazio"
+    assert not municipio.upper().startswith("UR "), f"municipio parece não-saneado (prefixo 'UR '): {municipio!r}"
+
+    # data_venda: formato minimamente coerente, se presente
+    data_venda = out.get("data_venda")
+    if isinstance(data_venda, str) and data_venda.strip():
+        # aceitamos dd/mm/aaaa ou aaaa-mm-dd
+        assert re.fullmatch(r"\d{2}/\d{2}/\d{4}|\d{4}-\d{2}-\d{2}", data_venda.strip()), (
+            f"data_venda em formato inesperado: {data_venda!r}"
+        )
+
+    # placa: se presente, 7 chars alfanum e sem espaços
+    placa = out.get("placa")
+    if isinstance(placa, str) and placa.strip():
+        p = placa.strip().upper().replace("-", "")
+        assert re.fullmatch(r"[A-Z0-9]{7}", p), f"placa em formato inesperado: {placa!r}"
+
+    # renavam: se presente, só dígitos e tamanho típico 9-11
+    renavam = out.get("renavam")
+    if isinstance(renavam, str) and renavam.strip():
+        r = _only_digits(renavam.strip())
+        assert r == renavam.strip(), f"renavam deve conter apenas dígitos: {renavam!r}"
+        assert 9 <= len(r) <= 11, f"renavam tamanho inesperado (9-11): {renavam!r}"
+
+    # chassi: se presente, 17 alfanum (sem espaços) (bem permissivo)
+    chassi = out.get("chassi")
+    if isinstance(chassi, str) and chassi.strip():
+        c = chassi.strip().upper()
+        assert re.fullmatch(r"[A-Z0-9]{17}", c), f"chassi em formato inesperado (esperado 17 alfanum): {chassi!r}"
+
+    # valor_venda: não forçar formato monetário; apenas evitar lixo óbvio (se presente)
+    valor_venda = out.get("valor_venda")
+    if isinstance(valor_venda, str) and valor_venda.strip():
+        vv = valor_venda.strip()
+        # aceita dígitos com separadores comuns (.,, e espaços). Não aceita letras.
+        assert re.fullmatch(r"[0-9\.\,\s]+", vv), f"valor_venda contém caracteres inesperados: {valor_venda!r}"
+
+    # ============================================================
+    # Passo 2 — asserts de negócio (vendedor vs comprador, JPEG etc)
+    # ============================================================
 
     vendedor_nome = (out.get("vendedor_nome") or "").strip()
     comprador_nome = (out.get("comprador_nome") or "").strip()
     vendedor_doc = (out.get("vendedor_cpf_cnpj") or "").strip()
     comprador_doc = (out.get("comprador_cpf_cnpj") or "").strip()
 
-    uf = (out.get("uf") or "").strip().upper()
-    municipio = (out.get("municipio") or "").strip()
-
     jpeg_like = _is_jpeg_like(fixture_path, out)
 
-    # (JPEG) — endurecer apenas quando o input é imagem/scan
     if jpeg_like:
         assert vendedor_nome, "vendedor_nome deve existir e não ser vazio (caso JPEG/image)"
         assert comprador_nome, "comprador_nome deve existir e não ser vazio (caso JPEG/image)"
@@ -165,16 +260,7 @@ def test_atpv_golden(fixture_path: Path, golden_path: Path) -> None:
         assert comprador_doc, "comprador_cpf_cnpj deve existir e não ser vazio (caso JPEG/image)"
         assert vendedor_doc != comprador_doc, "vendedor_cpf_cnpj não pode ser igual a comprador_cpf_cnpj (JPEG/image)"
     else:
-        # Para PDF com texto nativo, não exigimos presença; mas se ambos existirem, não podem ser iguais.
         if vendedor_nome and comprador_nome:
             assert vendedor_nome != comprador_nome, "vendedor_nome não pode ser igual a comprador_nome"
         if vendedor_doc and comprador_doc:
             assert vendedor_doc != comprador_doc, "vendedor_cpf_cnpj não pode ser igual a comprador_cpf_cnpj"
-
-    # UF válida e não nula (sempre)
-    assert uf, "uf não pode ser nula/vazia"
-    assert uf in UF_BR_VALIDAS, f"uf inválida: {uf!r}"
-
-    # Município saneado (não começar com 'UR ') (sempre)
-    assert municipio, "municipio não pode ser nulo/vazio"
-    assert not municipio.upper().startswith("UR "), f"municipio parece não-saneado (prefixo 'UR '): {municipio!r}"
