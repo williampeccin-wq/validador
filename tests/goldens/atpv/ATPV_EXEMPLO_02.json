@@ -1,9 +1,7 @@
 {
   "chassi": "9BD2651MHM9185242",
-  "cnpj": null,
-  "comprador_cpf_cnpj": "41100508656",
-  "comprador_nome": "COR PREDOMINANTE CHASSI LOCAL",
-  "cpf": "41100508656",
+  "comprador_cpf_cnpj": "01262046804",
+  "comprador_nome": null,
   "debug": {
     "min_text_len_threshold": 800,
     "mode": "native",
@@ -22,6 +20,6 @@
   "placa": "RMW8F32",
   "renavam": null,
   "valor_venda": "R$ 65.000,00",
-  "vendedor_cpf_cnpj": "01262046804",
-  "vendedor_nome": "MARIA ODETE FERREIRA REBELLO"
+  "vendedor_cpf_cnpj": null,
+  "vendedor_nome": null
 }
