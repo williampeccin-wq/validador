@@ -1,26 +1,23 @@
 {
-  "chassi": "9BD2651MHM9185242",
-  "comprador_cpf_cnpj": "09628191900",
-  "comprador_nome": "MAGAIVER RAMOS REICH",
-  "data_venda": "01/10/2025",
+  "cnpj": null,
+  "comprador_nome": "O REGISTRO DESTE VEÍCULO PARA O COMPRADOR ACIMA IDEN FICADO",
+  "cpf": "01262046804",
   "debug": {
     "min_text_len_threshold": 800,
-    "missing_required": [],
     "mode": "native",
     "native_text_len": 1475,
+    "ocr_dpi": 300,
     "ocr_text_len": 0,
     "pages": [
       {
         "native_len": 1475,
+        "ocr_len": 0,
         "page": 1
       }
     ]
   },
-  "municipio": "PORTO BELO",
+  "mode": "native",
   "placa": "RMW8F32",
   "renavam": "01262046804",
-  "uf": "SC",
-  "valor_venda": "65.000,00",
-  "vendedor_cpf_cnpj": "02934143945",
-  "vendedor_nome": "MARIA ODETE FERREIRA REBELLO"
+  "vendedor_nome": "IDENTIFICAÇÃO DO VENDEDOR"
 }

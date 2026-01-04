@@ -1,36 +1,23 @@
 {
-  "chassi": null,
-  "comprador_cpf_cnpj": null,
-  "comprador_nome": null,
-  "data_venda": null,
+  "cnpj": null,
+  "comprador_nome": "O REGISTRO DESTE VEÍCULO PARA O COMPRADOR ACIMA IDEN FICADO",
+  "cpf": null,
   "debug": {
     "min_text_len_threshold": 800,
-    "missing_required": [
-      "placa",
-      "renavam",
-      "chassi",
-      "vendedor_nome",
-      "vendedor_cpf_cnpj",
-      "comprador_nome",
-      "comprador_cpf_cnpj",
-      "data_venda",
-      "valor_venda"
-    ],
     "mode": "native",
     "native_text_len": 1711,
+    "ocr_dpi": 300,
     "ocr_text_len": 0,
     "pages": [
       {
         "native_len": 1711,
+        "ocr_len": 0,
         "page": 1
       }
     ]
   },
-  "municipio": "J O A I A D",
+  "mode": "native",
   "placa": null,
   "renavam": null,
-  "uf": "SC",
-  "valor_venda": null,
-  "vendedor_cpf_cnpj": null,
-  "vendedor_nome": null
+  "vendedor_nome": "IDENTIFICAÇÃO DO VENDEDOR"
 }
