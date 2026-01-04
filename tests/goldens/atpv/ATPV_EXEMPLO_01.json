@@ -1,6 +1,8 @@
 {
+  "chassi": null,
   "cnpj": null,
-  "comprador_nome": "O REGISTRO DESTE VEÍCULO PARA O COMPRADOR ACIMA IDEN FICADO",
+  "comprador_cpf_cnpj": null,
+  "comprador_nome": "COR PREDOMINANTE CHASSI LOCAL",
   "cpf": null,
   "debug": {
     "min_text_len_threshold": 800,
@@ -19,5 +21,7 @@
   "mode": "native",
   "placa": null,
   "renavam": null,
-  "vendedor_nome": "IDENTIFICAÇÃO DO VENDEDOR"
+  "valor_venda": null,
+  "vendedor_cpf_cnpj": null,
+  "vendedor_nome": "CÓDIGO RENAVAM"
 }

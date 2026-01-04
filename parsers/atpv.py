@@ -1,25 +1,10 @@
 # parsers/atpv.py
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import re
 
-# Dependências esperadas:
-# - pdfplumber (texto nativo)
-# - (opcional) pdf2image + pytesseract (OCR fallback)
-#
-# Se você já tem uma camada OCR interna, substitua _ocr_pdf_to_text()
-# e mantenha o contrato de output (mode + debug).
-
 MIN_TEXT_LEN_THRESHOLD_DEFAULT = 800
-
-
-@dataclass(frozen=True)
-class PageDebug:
-    page: int
-    native_len: int
-    ocr_len: int
 
 
 def analyze_atpv(
@@ -28,16 +13,8 @@ def analyze_atpv(
     min_text_len_threshold: int = MIN_TEXT_LEN_THRESHOLD_DEFAULT,
     ocr_dpi: int = 300,
 ) -> Dict[str, Any]:
-    """
-    Lê um ATPV (PDF) e retorna um dict com:
-    - mode: "native" ou "ocr"
-    - campos extraídos (se houver)
-    - debug com métricas determinísticas (len de texto, páginas, etc.)
-    """
     native_text, pages_native_len = _extract_native_text(pdf_path)
 
-    # Decide modo por regra interna DO PARSER (teste não deve reproduzir isso).
-    # Regra: se texto nativo for suficiente, fica em native; senão, OCR.
     if len(native_text) >= min_text_len_threshold:
         mode = "native"
         ocr_text = ""
@@ -46,10 +23,8 @@ def analyze_atpv(
         mode = "ocr"
         ocr_text, pages_ocr_len = _ocr_pdf_to_text(pdf_path, dpi=ocr_dpi)
 
-    # Texto efetivo usado para parse de campos
     text = native_text if mode == "native" else ocr_text
 
-    # Extrai campos (mínimo viável; ajuste conforme seu parser real)
     extracted = _extract_fields(text)
 
     debug_pages: List[Dict[str, Any]] = []
@@ -67,9 +42,9 @@ def analyze_atpv(
 
     out: Dict[str, Any] = {
         **extracted,
-        "mode": mode,  # <-- PASSO 5: explicitar mode no output
+        "mode": mode,
         "debug": {
-            "mode": mode,  # redundante por design (facilita teste e inspeção)
+            "mode": mode,
             "native_text_len": int(len(native_text)),
             "ocr_text_len": int(len(ocr_text)),
             "min_text_len_threshold": int(min_text_len_threshold),
@@ -105,7 +80,7 @@ def _extract_native_text(pdf_path: str) -> Tuple[str, List[int]]:
 
 def _ocr_pdf_to_text(pdf_path: str, *, dpi: int) -> Tuple[str, List[int]]:
     """
-    OCR fallback. Mantém a função isolada para você trocar facilmente por sua camada OCR atual.
+    OCR fallback. Se você já tem OCR interno, substitua esta função.
     """
     try:
         from pdf2image import convert_from_path  # type: ignore
@@ -136,41 +111,74 @@ def _ocr_pdf_to_text(pdf_path: str, *, dpi: int) -> Tuple[str, List[int]]:
 
 
 # -----------------------------
-# Parse de campos (MVP)
+# Parse de campos
 # -----------------------------
 
 _CPF_RE = re.compile(r"\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2})\b")
 _CNPJ_RE = re.compile(r"\b(\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2})\b")
-_PLATE_RE = re.compile(r"\b([A-Z]{3}[0-9][A-Z0-9][0-9]{2})\b")  # Mercosul/antiga simpl.
-_RENAVAM_RE = re.compile(r"\b(\d{9,11})\b")
+_PLATE_RE = re.compile(r"\b([A-Z]{3}[0-9][A-Z0-9][0-9]{2})\b")  # Mercosul/antiga
+# VIN sem I/O/Q e 17 chars
+_VIN_RE = re.compile(r"\b([A-HJ-NPR-Z0-9]{17})\b")
+
+# BRL: captura "R$ 1.234,56" ou "1.234,56" ou "1234,56"
+_MONEY_RE = re.compile(r"(R\$\s*)?(\d{1,3}(\.\d{3})*|\d+),\d{2}\b")
+
+# âncoras mais comuns
+_ANCHOR_BUYER = ("COMPRADOR", "ADQUIRENTE")
+_ANCHOR_SELLER = ("VENDEDOR", "ALIENANTE")
+
+# frases não-nome (aparecem nos seus goldens nativos atuais)
+_BAD_NAME_SNIPPETS = (
+    "IDENTIFICAÇÃO DO VENDEDOR",
+    "IDENTIFICACAO DO VENDEDOR",
+    "IDENTIFICAÇÃO DO COMPRADOR",
+    "IDENTIFICACAO DO COMPRADOR",
+    "O REGISTRO DESTE VEÍCULO",
+    "O REGISTRO DESTE VEICULO",
+)
+
+_NAME_CHARS_RE = re.compile(r"[^A-ZÀ-Ü ]")
 
 
 def _extract_fields(text: str) -> Dict[str, Any]:
-    """
-    Aqui entra seu parser real do ATPV. Mantive um MVP que não quebra testes de contrato.
-    Você pode expandir campos mantendo as chaves existentes (se já houver).
-    """
     norm = _normalize(text)
+    lines = _lines(norm)
 
-    cpf = _first_match(_CPF_RE, norm)
-    cnpj = _first_match(_CNPJ_RE, norm)
     placa = _first_match(_PLATE_RE, norm)
+    chassi = _first_match(_VIN_RE, norm)
 
-    # RENAVAM: altamente ambíguo (muitos números no documento). MVP: tenta pegar algo plausível
-    # priorizando ocorrência perto do token 'RENAVAM' se existir.
-    renavam = _extract_renavam(norm)
+    # RENAVAM: prioriza linha com "RENAVAM"
+    renavam = _extract_renavam(lines)
 
-    # Nomes do comprador/vendedor variam; se você já tem lógica, substitua.
-    comprador_nome = _extract_anchor_name(norm, anchor_tokens=("COMPRADOR", "ADQUIRENTE"))
-    vendedor_nome = _extract_anchor_name(norm, anchor_tokens=("VENDEDOR", "ALIENANTE"))
+    # Valor: prioriza linhas com "VALOR" + "VENDA"/"TRANSA" etc.
+    valor_venda = _extract_valor_venda(lines)
+
+    # Comprador: nome + doc por âncora
+    comprador_nome, comprador_doc = _extract_person_block(lines, anchors=_ANCHOR_BUYER)
+
+    # Vendedor: nome por âncora; doc opcional (não exigido pelo seu contrato aqui)
+    vendedor_nome, vendedor_doc = _extract_person_block(lines, anchors=_ANCHOR_SELLER)
+
+    # Compat: ainda exponho cpf/cnpj “soltos”, mas canonical é comprador_cpf_cnpj
+    cpf = _only_digits(comprador_doc) if (comprador_doc and len(_only_digits(comprador_doc)) == 11) else None
+    cnpj = _only_digits(comprador_doc) if (comprador_doc and len(_only_digits(comprador_doc)) == 14) else None
 
     return {
-        "comprador_nome": comprador_nome,
-        "vendedor_nome": vendedor_nome,
-        "cpf": cpf,
-        "cnpj": cnpj,
+        # Obrigatórios (devem ser preenchidos com melhoria contínua do parser)
         "placa": placa,
         "renavam": renavam,
+        "chassi": chassi,
+        "valor_venda": valor_venda,
+        "comprador_cpf_cnpj": _only_digits(comprador_doc) if comprador_doc else None,
+        "comprador_nome": comprador_nome,
+        "vendedor_nome": vendedor_nome,
+
+        # Extras úteis
+        "vendedor_cpf_cnpj": _only_digits(vendedor_doc) if vendedor_doc else None,
+
+        # Retrocompat (se alguém usa isso)
+        "cpf": cpf,
+        "cnpj": cnpj,
     }
 
 
@@ -181,45 +189,110 @@ def _normalize(s: str) -> str:
     return s.strip()
 
 
+def _lines(s: str) -> List[str]:
+    return [ln.strip() for ln in s.splitlines() if ln.strip()]
+
+
+def _only_digits(s: str) -> str:
+    return re.sub(r"\D+", "", s)
+
+
 def _first_match(rx: re.Pattern[str], s: str) -> Optional[str]:
     m = rx.search(s)
     return m.group(1) if m else None
 
 
-def _extract_renavam(s: str) -> Optional[str]:
-    # Se houver "RENAVAM" ou "RENAVAM:", tenta capturar números logo após.
-    m = re.search(r"RENAVAM[^0-9]{0,20}([0-9]{9,11})", s, flags=re.IGNORECASE)
-    if m:
-        return m.group(1)
-
-    # Fallback extremamente conservador: retorna o primeiro 11/10/9 dígitos que não seja CPF/CNPJ/CEP comum.
-    # (Se isso atrapalhar, melhor retornar None do que errar.)
-    candidates = _RENAVAM_RE.findall(s)
-    for c in candidates:
-        if len(c) in (9, 10, 11):
-            return c
+def _extract_renavam(lines: List[str]) -> Optional[str]:
+    for ln in lines:
+        if "RENAVAM" in ln.upper():
+            m = re.search(r"RENAVAM[^0-9]{0,25}([0-9]{9,11})", ln, flags=re.IGNORECASE)
+            if m:
+                return m.group(1)
+            # fallback: qualquer 9-11 dígitos na mesma linha
+            digs = re.findall(r"\b([0-9]{9,11})\b", ln)
+            if digs:
+                return digs[0]
     return None
 
 
-def _extract_anchor_name(s: str, *, anchor_tokens: Tuple[str, ...]) -> Optional[str]:
-    """
-    Busca linhas próximas de um rótulo e tenta extrair um nome (somente letras + espaços).
-    É propositalmente fraca para não inventar; seu parser real deve ser mais forte.
-    """
-    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
-    if not lines:
-        return None
+def _extract_valor_venda(lines: List[str]) -> Optional[str]:
+    # prioridade: linhas com "VALOR" e contexto de venda
+    priority_keys = ("VALOR", "VENDA", "TRANSA", "NEGOC", "ALIENA")
+    for ln in lines:
+        up = ln.upper()
+        if "VALOR" in up and any(k in up for k in priority_keys):
+            m = _MONEY_RE.search(ln)
+            if m:
+                # retorna no formato "1234,56" (mantém vírgula) ou com R$
+                return m.group(0).strip()
+    # fallback: primeira ocorrência monetária do documento (conservador)
+    for ln in lines:
+        m = _MONEY_RE.search(ln)
+        if m:
+            return m.group(0).strip()
+    return None
 
-    anchors_upper = tuple(a.upper() for a in anchor_tokens)
+
+def _extract_person_block(lines: List[str], anchors: Tuple[str, ...]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Heurística baseada em blocos: procura uma linha âncora, e busca nas próximas linhas:
+      - nome humano (linha mais provável)
+      - documento CPF/CNPJ (onde aparecer)
+    """
+    anchors_upper = tuple(a.upper() for a in anchors)
+    n = len(lines)
     for i, ln in enumerate(lines):
         up = ln.upper()
         if any(a in up for a in anchors_upper):
-            # tenta pegar o próximo trecho/linha
-            for j in range(i, min(i + 3, len(lines))):
-                cand = lines[j]
-                cand = re.sub(r"[^A-ZÀ-Ü ]", " ", cand.upper())
-                cand = re.sub(r"\s{2,}", " ", cand).strip()
-                # heurística mínima: ao menos 2 palavras e tamanho razoável
-                if len(cand) >= 10 and len(cand.split()) >= 2:
-                    return cand
+            # janela curta após âncora
+            window = lines[i : min(i + 8, n)]
+            name = _find_name_in_window(window)
+            doc = _find_doc_in_window(window)
+            return name, doc
+
+    # fallback: tenta achar doc em qualquer lugar, e nome em qualquer lugar (último recurso)
+    doc = _find_doc_in_window(lines)
+    name = _find_name_in_window(lines)
+    return name, doc
+
+
+def _find_doc_in_window(lines: List[str]) -> Optional[str]:
+    for ln in lines:
+        m = _CPF_RE.search(ln)
+        if m:
+            return m.group(1)
+        m = _CNPJ_RE.search(ln)
+        if m:
+            return m.group(1)
+        # fallback: números longos 11/14 próximos a palavras CPF/CNPJ
+        up = ln.upper()
+        if "CPF" in up or "CNPJ" in up:
+            digs = re.findall(r"\b([0-9]{11}|[0-9]{14})\b", _only_digits(ln))
+            if digs:
+                return digs[0]
+    return None
+
+
+def _find_name_in_window(lines: List[str]) -> Optional[str]:
+    """
+    Busca um nome humano, evitando labels/frases institucionais.
+    """
+    for ln in lines:
+        up = ln.upper()
+        if any(bad in up for bad in _BAD_NAME_SNIPPETS):
+            continue
+
+        # remove dígitos e pontuação, mantém letras/acentos/espaços
+        cand = up
+        cand = _NAME_CHARS_RE.sub(" ", cand)
+        cand = re.sub(r"\s{2,}", " ", cand).strip()
+
+        # Heurística mínima de "nome humano"
+        parts = [p for p in cand.split(" ") if p]
+        if len(parts) >= 2 and len(cand) >= 10:
+            # evita linhas com palavras típicas de cabeçalho
+            if "IDENTIFICA" in cand or "REGISTRO" in cand or "VEÍCULO" in cand or "VEICULO" in cand:
+                continue
+            return cand
+
     return None

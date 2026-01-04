@@ -1,7 +1,9 @@
 {
+  "chassi": "9BD2651MHM9185242",
   "cnpj": null,
-  "comprador_nome": "O REGISTRO DESTE VEÍCULO PARA O COMPRADOR ACIMA IDEN FICADO",
-  "cpf": "01262046804",
+  "comprador_cpf_cnpj": "41100508656",
+  "comprador_nome": "COR PREDOMINANTE CHASSI LOCAL",
+  "cpf": "41100508656",
   "debug": {
     "min_text_len_threshold": 800,
     "mode": "native",
@@ -18,6 +20,8 @@
   },
   "mode": "native",
   "placa": "RMW8F32",
-  "renavam": "01262046804",
-  "vendedor_nome": "IDENTIFICAÇÃO DO VENDEDOR"
+  "renavam": null,
+  "valor_venda": "R$ 65.000,00",
+  "vendedor_cpf_cnpj": "01262046804",
+  "vendedor_nome": "MARIA ODETE FERREIRA REBELLO"
 }
