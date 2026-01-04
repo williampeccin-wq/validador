@@ -1,7 +1,7 @@
 {
   "chassi": "9BD2651MHM9185242",
   "comprador_cpf_cnpj": "09628191900",
-  "comprador_nome": "MARIA ODETE FERREIRA REBELLO COSJENES EMAL NAOINFORMADOGNAO INFO C OM",
+  "comprador_nome": "MAGAIVER RAMOS REICH CORTENE",
   "data_venda": "01/10/2025",
   "debug": {
     "min_text_len_threshold": 800,
@@ -22,5 +22,5 @@
   "uf": "SC",
   "valor_venda": "65.000,00",
   "vendedor_cpf_cnpj": "02934143945",
-  "vendedor_nome": "MARIA ODETE FERREIRA REBELLO COSJENES EMAL NAOINFORMADOGNAO INFO C OM"
+  "vendedor_nome": "MARIA ODETE FERREIRA REBELLO"
 }

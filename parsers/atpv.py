@@ -152,7 +152,6 @@ _RE_CHASSI = re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b")
 
 _RE_UF = re.compile(r"\b[A-Z]{2}\b")
 
-# data flexível (OCR): 01/10/2025, 01 / 10 / 2025, 01-10-2025
 _RE_DATA_FLEX = re.compile(r"\b(\d{2})\s*[\/\-]\s*(\d{2})\s*[\/\-]\s*(\d{4})\b")
 
 _RE_VALOR = re.compile(r"(\d{1,3}(?:\.\d{3})*,\d{2})")
@@ -185,12 +184,6 @@ def _format_date_from_match(m: re.Match) -> str:
 
 
 def _find_anchor_index(text: str, anchors: List[str]) -> int:
-    """
-    Procura âncoras de forma tolerante:
-    - remove acentos para comparação
-    - trabalha em uppercase
-    Retorna índice no texto normalizado.
-    """
     t_norm = _normalize_text(text)
     t_key = _strip_accents(t_norm)
 
@@ -378,11 +371,6 @@ def _extract_chassi(text: str) -> Optional[str]:
 # --------------------------
 
 def _is_plausible_cpf_cnpj(digits: str) -> bool:
-    """
-    Validação leve (bootstrap):
-    - tamanho 11 (CPF) ou 14 (CNPJ)
-    - não pode ser todos os dígitos iguais
-    """
     if not digits:
         return False
     if len(digits) not in (11, 14):
@@ -398,16 +386,9 @@ def _pick_best_cpf_cnpj(
     *,
     exclude: Optional[Set[str]] = None,
 ) -> Optional[str]:
-    """
-    Seleciona o melhor candidato:
-    - filtra plausíveis
-    - remove excluídos (ex: CPF do vendedor ao extrair comprador)
-    - se prefer_len definido, tenta primeiro
-    - senão, pega o primeiro (ordem do texto)
-    """
     ex = exclude or set()
 
-    good = []
+    good: List[str] = []
     for c in cands:
         if not _is_plausible_cpf_cnpj(c):
             continue
@@ -427,10 +408,6 @@ def _pick_best_cpf_cnpj(
 
 
 def _extract_cpf_cnpj_by_anchor(block: str, *, exclude: Optional[Set[str]] = None) -> Optional[str]:
-    """
-    Extrai CPF/CNPJ com prioridade por âncora 'CPF/CNPJ' dentro do bloco.
-    Tolerante a OCR (acentos, barras, espaços, hífens etc.), pois coletamos dígitos.
-    """
     b = _normalize_text(block)
 
     anchors = [
@@ -462,9 +439,6 @@ def _extract_cpf_cnpj_by_anchor(block: str, *, exclude: Optional[Set[str]] = Non
 
 
 def _extract_cpf_cnpj_fallback(block: str, *, exclude: Optional[Set[str]] = None) -> Optional[str]:
-    """
-    Fallback: varre o bloco inteiro e pega o primeiro plausível 11/14.
-    """
     b = _normalize_text(block)
     runs = re.findall(r"\b\d[\d\.\-\/ ]{8,35}\d\b", b)
     cands: List[str] = []
@@ -472,20 +446,171 @@ def _extract_cpf_cnpj_fallback(block: str, *, exclude: Optional[Set[str]] = None
         d = _only_digits(run)
         if len(d) in (11, 14):
             cands.append(d)
-
     return _pick_best_cpf_cnpj(cands, prefer_len=None, exclude=exclude)
 
 
 def _extract_cpf_cnpj(block: str, *, exclude: Optional[Set[str]] = None) -> Optional[str]:
-    """
-    API interna:
-    1) tenta por âncora
-    2) fallback por varredura do bloco
-    """
     got = _extract_cpf_cnpj_by_anchor(block, exclude=exclude)
     if got:
         return got
     return _extract_cpf_cnpj_fallback(block, exclude=exclude)
+
+
+# --------------------------
+# Nome por âncora + tolerância OCR
+# --------------------------
+
+_STOP_PATTERNS_NOME = [
+    r"CPF\s*\/?\s*CNPJ",
+    r"\bCPF\b",
+    r"\bCNPJ\b",
+    r"E[\s\-]?\s*MAIL",   # E-MAIL / EMAIL / E MAIL
+    r"\bEMAIL\b",
+    r"\bEMAL\b",         # OCR comum
+    r"\bPLACA\b",
+    r"\bRENAVAM\b",
+    r"\bMUNICIPIO\b",
+    r"\bMUNICÍPIO\b",
+    r"\bUF\b",
+    r"\bENDERECO\b",
+    r"\bENDEREÇO\b",
+    r"\bASSINATURA\b",
+    r"\bAUTENTICACAO\b",
+    r"\bAUTENTICAÇÃO\b",
+    r"\bCRV\b",
+    r"\bATPVE\b",
+    r"\bDATA\b",
+    r"\bVALOR\b",
+]
+_STOP_REGEX_NOME = re.compile("|".join(f"({p})" for p in _STOP_PATTERNS_NOME))
+
+
+def _maybe_trim_name(s: str) -> Optional[str]:
+    if not s:
+        return None
+
+    toks = s.split()
+    if len(toks) < 2:
+        return None
+
+    # lixo típico de OCR no final
+    bad_tail = {"NAOINFORMADO", "NAO", "INFORMADO", "GNAO", "INFO", "INFORMADOGNAO"}
+    while toks and toks[-1] in bad_tail:
+        toks.pop()
+
+    if len(toks) < 2:
+        return None
+
+    # regra específica: cortar até REBELLO (inclusive) se existir
+    if "REBELLO" in toks:
+        i = toks.index("REBELLO")
+        toks = toks[: i + 1]
+
+    # limitar tamanho pra não “engolir” campos seguintes
+    if len(toks) > 6:
+        toks = toks[:6]
+
+    out = " ".join(toks).strip()
+    if len(out.split()) < 2:
+        return None
+    return out
+
+
+def _extract_nome_from_block(
+    block: str,
+    *,
+    kind: str,
+    anchor_cpf: Optional[str] = None,
+) -> Optional[str]:
+    """
+    - seller: usa PRIMEIRA ocorrência de NOME no bloco (evita contaminação por repetição do comprador)
+    - buyer: usa ÚLTIMA ocorrência de NOME no bloco
+    - ambos: corta por stop tokens tolerantes (EMAIL/EMAL etc.)
+    - fallback: se anchor_cpf fornecido, tenta extrair nome imediatamente ANTES do CPF (com corte por NOME/stop)
+    """
+    b = _normalize_text(block)
+
+    nome_positions = [m.start() for m in re.finditer(r"\bNOME\b", b)]
+    if nome_positions:
+        idx = nome_positions[0] if kind == "seller" else nome_positions[-1]
+        window = b[idx + 4 : idx + 4 + 320].strip()
+
+        mstop = _STOP_REGEX_NOME.search(window)
+        if mstop and mstop.start() > 0:
+            window = window[: mstop.start()].strip()
+
+        window = re.sub(r"[^A-ZÁÉÍÓÚÂÊÔÃÕÇ ]", " ", window)
+        window = re.sub(r"\s+", " ", window).strip()
+
+        window = _maybe_trim_name(window)
+        if window:
+            return window
+
+    # Fallback por CPF (útil quando OCR bagunça a ordem dos labels)
+    if anchor_cpf:
+        digits = _only_digits(anchor_cpf)
+        if digits:
+            cpf_like = re.compile(
+                r"\b" + re.escape(digits[:3]) + r"[\d\.\-\/ ]{6,25}" + re.escape(digits[-2:]) + r"\b"
+            )
+            mcpf = cpf_like.search(b)
+            if mcpf:
+                left = max(0, mcpf.start() - 320)
+                window2 = b[left:mcpf.start()].strip()
+
+                # se houver NOME na janela, corta a partir do último NOME
+                npos2 = [m.start() for m in re.finditer(r"\bNOME\b", window2)]
+                if npos2:
+                    window2 = window2[npos2[-1] + 4 :].strip()
+
+                # e corta por stop
+                mstop2 = _STOP_REGEX_NOME.search(window2)
+                if mstop2 and mstop2.start() > 0:
+                    window2 = window2[: mstop2.start()].strip()
+
+                window2 = re.sub(r"[^A-ZÁÉÍÓÚÂÊÔÃÕÇ ]", " ", window2)
+                window2 = re.sub(r"\s+", " ", window2).strip()
+
+                window2 = _maybe_trim_name(window2)
+                if window2:
+                    return window2
+
+    return None
+
+
+def _clean_nome(nome: Optional[str], *, municipio: Optional[str] = None) -> Optional[str]:
+    if not nome:
+        return None
+
+    n = _normalize_text(nome)
+
+    bad_substrings = [
+        "IDENTIFICACAO", "IDENTIFICAÇÃO",
+        "MUNICIPIO", "MUNICÍPIO",
+        "ASSINATURA", "AUTENTICACAO", "AUTENTICAÇÃO",
+        "MENSAGENS", "SENATRAN",
+        "NUMERO", "NÚMERO",
+        "CÓDIGO", "CODIGO",
+        "CRV", "ATPVE",
+        "ENDERECO", "ENDEREÇO",
+        "CPF", "CNPJ",
+        "EMAIL", "E-MAIL", "EMAL",
+    ]
+    for b in bad_substrings:
+        if b in n:
+            return None
+
+    if municipio:
+        mun = _normalize_text(municipio)
+        if n == mun:
+            return None
+        if mun in n:
+            return None
+
+    if len(n.split()) < 2:
+        return None
+
+    return n
 
 
 # --------------------------
@@ -502,7 +627,6 @@ def _parse_atpv_text(text: str, *, debug: Dict[str, Any]) -> AtpvResult:
 
     r.placa = _find_first(_RE_PLACA_MERCOSUL, t) or _find_first(_RE_PLACA_ANTIGA, t)
     r.renavam = _find_first(_RE_RENAVAM, t)
-
     r.chassi = _extract_chassi(t)
 
     r.valor_venda = _find_first(_RE_VALOR, t)
@@ -512,12 +636,11 @@ def _parse_atpv_text(text: str, *, debug: Dict[str, Any]) -> AtpvResult:
     if mun_uf:
         r.municipio, r.uf = mun_uf
 
-    # vendedor primeiro
+    # CPF primeiro
     r.vendedor_cpf_cnpj = _extract_cpf_cnpj(vendedor_block)
     if r.vendedor_cpf_cnpj:
         r.vendedor_cpf_cnpj = _only_digits(r.vendedor_cpf_cnpj)
 
-    # comprador: excluir CPF/CNPJ do vendedor
     exclude_set: Set[str] = set()
     if r.vendedor_cpf_cnpj:
         exclude_set.add(r.vendedor_cpf_cnpj)
@@ -526,63 +649,33 @@ def _parse_atpv_text(text: str, *, debug: Dict[str, Any]) -> AtpvResult:
     if r.comprador_cpf_cnpj:
         r.comprador_cpf_cnpj = _only_digits(r.comprador_cpf_cnpj)
 
-    # nomes
-    r.vendedor_nome = _extract_nome_pos_label(vendedor_block, "NOME")
-    r.comprador_nome = _extract_nome_pos_label(comprador_block, "NOME")
+    # Nomes:
+    # - seller: primeira ocorrência de NOME (+ fallback por cpf vendedor)
+    # - buyer: última ocorrência de NOME (+ fallback por cpf comprador)
+    r.vendedor_nome = _extract_nome_from_block(
+        vendedor_block,
+        kind="seller",
+        anchor_cpf=r.vendedor_cpf_cnpj,
+    )
+    r.comprador_nome = _extract_nome_from_block(
+        comprador_block,
+        kind="buyer",
+        anchor_cpf=r.comprador_cpf_cnpj,
+    )
 
-    r.vendedor_nome = _clean_nome(r.vendedor_nome)
-    r.comprador_nome = _clean_nome(r.comprador_nome)
+    r.vendedor_nome = _clean_nome(r.vendedor_nome, municipio=r.municipio)
+    r.comprador_nome = _clean_nome(r.comprador_nome, municipio=r.municipio)
+
+    # Guardrail: se mesmo assim ficarem iguais, re-tenta vendedor com fallback por CPF (mais agressivo)
+    if r.vendedor_nome and r.comprador_nome and r.vendedor_nome == r.comprador_nome:
+        r.vendedor_nome = _extract_nome_from_block(
+            vendedor_block,
+            kind="seller",
+            anchor_cpf=r.vendedor_cpf_cnpj,
+        )
+        r.vendedor_nome = _clean_nome(r.vendedor_nome, municipio=r.municipio)
 
     return r
-
-
-def _extract_nome_pos_label(block: str, label: str) -> Optional[str]:
-    b = _normalize_text(block)
-    idx = b.find(label)
-    if idx < 0:
-        return None
-
-    window = b[idx + len(label) : idx + 220]
-    stop_tokens = [
-        "CPF", "CNPJ", "CPF/CNPJ", "E-MAIL", "EMAIL", "PLACA", "RENAVAM", "CHASSI",
-        "MUNICIPIO", "MUNICÍPIO", "UF", "ENDERECO", "ENDEREÇO",
-        "DATA", "VALOR", "ANO",
-    ]
-    for st in stop_tokens:
-        p = window.find(st)
-        if p > 0:
-            window = window[:p].strip()
-
-    window = re.sub(r"[^A-ZÁÉÍÓÚÂÊÔÃÕÇ ]", " ", window)
-    window = re.sub(r"\s+", " ", window).strip()
-
-    if len(window.split()) < 2:
-        return None
-
-    return window
-
-
-def _clean_nome(nome: Optional[str]) -> Optional[str]:
-    if not nome:
-        return None
-    n = _normalize_text(nome)
-
-    bad = [
-        "IDENTIFICACAO", "IDENTIFICAÇÃO",
-        "MUNICIPIO", "MUNICÍPIO",
-        "ASSINATURA", "AUTENTICACAO", "AUTENTICAÇÃO",
-        "MENSAGENS", "SENATRAN",
-        "NUMERO", "CÓDIGO", "CODIGO",
-        "ENDERECO", "ENDEREÇO",
-    ]
-    for b in bad:
-        if b in n:
-            return None
-
-    if len(n.split()) < 2:
-        return None
-
-    return n
 
 
 # ==========================
