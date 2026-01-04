@@ -1,17 +1,17 @@
 {
   "chassi": "9BD2651MHM9185242",
   "comprador_cpf_cnpj": "09628191900",
-  "comprador_nome": "MAGAIVER RAMOS REICH CORTENE",
+  "comprador_nome": "MAGAIVER RAMOS REICH",
   "data_venda": "01/10/2025",
   "debug": {
     "min_text_len_threshold": 800,
     "missing_required": [],
-    "mode": "ocr",
-    "native_text_len": 0,
-    "ocr_text_len": 1514,
+    "mode": "native",
+    "native_text_len": 1475,
+    "ocr_text_len": 0,
     "pages": [
       {
-        "ocr_len": 1514,
+        "native_len": 1475,
         "page": 1
       }
     ]
