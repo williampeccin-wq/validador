@@ -1,0 +1,28 @@
+{
+  "chassi": "9BD2651MHM9185242",
+  "comprador_cpf_cnpj": "09628191900",
+  "comprador_nome": "MAGAIVER RAMOS REICH CPE CNPI",
+  "data_venda": "01/10/2025",
+  "debug": {
+    "min_text_len_threshold": 800,
+    "missing_required": [
+      "valor_venda"
+    ],
+    "mode": "ocr",
+    "native_text_len": 0,
+    "ocr_text_len": 1519,
+    "pages": [
+      {
+        "ocr_len": 1519,
+        "page": 1
+      }
+    ]
+  },
+  "municipio": "PORTO BELO",
+  "placa": "RMW8F32",
+  "renavam": "01262046804",
+  "uf": "SE",
+  "valor_venda": null,
+  "vendedor_cpf_cnpj": "02934143945",
+  "vendedor_nome": "MARIA ODETE FERREIRA REBELLO"
+}

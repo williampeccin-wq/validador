@@ -8,7 +8,6 @@ from typing import Any, Dict, Tuple
 
 import pytest
 
-# Ajuste aqui caso o seu parser exponha outro símbolo público.
 from parsers.atpv import analyze_atpv  # type: ignore
 
 
@@ -21,6 +20,8 @@ UF_BR_VALIDAS = {
     "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI",
     "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO",
 }
+
+FIXTURE_EXTS = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
 
 
 def _read_json(path: Path) -> Dict[str, Any]:
@@ -37,16 +38,18 @@ def _write_json(path: Path, obj: Dict[str, Any]) -> None:
 
 def _collect_pairs() -> list[Tuple[Path, Path]]:
     """
-    Retorna pares (pdf_path, golden_json_path) para todos os goldens existentes.
+    Retorna pares (fixture_path, golden_json_path) para todos os goldens existentes.
 
     Convenção:
       tests/goldens/atpv/<BASE>.json
 
-    E o PDF correspondente deve existir em:
-      - tests/fixtures/atpv/<BASE>.pdf  (preferencial)
-      - ou tests/atpv/<BASE>.pdf
-      - ou tests/data/atpv/<BASE>.pdf
-      - ou ao lado do golden: tests/goldens/atpv/<BASE>.pdf
+    E o fixture correspondente pode existir em (na primeira ocorrência encontrada):
+      - tests/fixtures/atpv/<BASE>.<ext>  (preferencial)
+      - ou tests/atpv/<BASE>.<ext>
+      - ou tests/data/atpv/<BASE>.<ext>
+      - ou ao lado do golden: tests/goldens/atpv/<BASE>.<ext>
+
+    Onde <ext> ∈ { .pdf, .png, .jpg, .jpeg, .webp }.
     """
     candidates_roots = [
         HERE / "fixtures" / "atpv",
@@ -58,15 +61,22 @@ def _collect_pairs() -> list[Tuple[Path, Path]]:
     pairs: list[Tuple[Path, Path]] = []
     for golden_path in sorted(GOLDEN_DIR.glob("*.json")):
         base = golden_path.stem
-        pdf_path = None
+        fixture_path: Path | None = None
+
         for root in candidates_roots:
-            cand = root / f"{base}.pdf"
-            if cand.exists():
-                pdf_path = cand
+            for ext in FIXTURE_EXTS:
+                cand = root / f"{base}{ext}"
+                if cand.exists():
+                    fixture_path = cand
+                    break
+            if fixture_path is not None:
                 break
-        if pdf_path is None:
+
+        if fixture_path is None:
             continue
-        pairs.append((pdf_path, golden_path))
+
+        pairs.append((fixture_path, golden_path))
+
     return pairs
 
 
@@ -77,7 +87,7 @@ def _as_int(v: Any, default: int = 0) -> int:
         return default
 
 
-def _is_jpeg_like(pdf_path: Path, out: Dict[str, Any]) -> bool:
+def _is_jpeg_like(fixture_path: Path, out: Dict[str, Any]) -> bool:
     """
     Heurística para identificar casos "JPEG-like" (imagem/scan), onde faz sentido
     endurecer asserts de identidade (vendedor vs comprador etc).
@@ -87,7 +97,7 @@ def _is_jpeg_like(pdf_path: Path, out: Dict[str, Any]) -> bool:
       - out["mode"] ou out["debug"]["mode"] sugere OCR/image
       - debug sugere texto nativo inexistente e OCR presente
     """
-    ext = pdf_path.suffix.lower()
+    ext = fixture_path.suffix.lower()
     if ext in {".jpg", ".jpeg", ".png", ".webp"}:
         return True
 
@@ -105,7 +115,6 @@ def _is_jpeg_like(pdf_path: Path, out: Dict[str, Any]) -> bool:
     if native_len == 0 and ocr_len > 0:
         return True
 
-    # Alguns parsers usam "native_len"/"ocr_len" agregados ou por página
     native_len2 = _as_int(debug.get("native_len"), 0)
     ocr_len2 = _as_int(debug.get("ocr_len"), 0)
     if native_len2 == 0 and ocr_len2 > 0:
@@ -114,8 +123,8 @@ def _is_jpeg_like(pdf_path: Path, out: Dict[str, Any]) -> bool:
     return False
 
 
-@pytest.mark.parametrize("pdf_path,golden_path", _collect_pairs(), ids=lambda p: getattr(p, "name", str(p)))
-def test_atpv_golden(pdf_path: Path, golden_path: Path) -> None:
+@pytest.mark.parametrize("fixture_path,golden_path", _collect_pairs(), ids=lambda p: getattr(p, "name", str(p)))
+def test_atpv_golden(fixture_path: Path, golden_path: Path) -> None:
     """
     Golden test do parser de ATPV.
 
@@ -123,7 +132,7 @@ def test_atpv_golden(pdf_path: Path, golden_path: Path) -> None:
       - Se WRITE_GOLDEN=1: regrava o golden e SKIP (não falha por diferença).
       - Caso contrário: compara output com golden e aplica asserts "endurecidos".
     """
-    out: Dict[str, Any] = analyze_atpv(str(pdf_path))
+    out: Dict[str, Any] = analyze_atpv(str(fixture_path))
 
     if WRITE_GOLDEN:
         _write_json(golden_path, out)
@@ -144,7 +153,7 @@ def test_atpv_golden(pdf_path: Path, golden_path: Path) -> None:
     uf = (out.get("uf") or "").strip().upper()
     municipio = (out.get("municipio") or "").strip()
 
-    jpeg_like = _is_jpeg_like(pdf_path, out)
+    jpeg_like = _is_jpeg_like(fixture_path, out)
 
     # (JPEG) — endurecer apenas quando o input é imagem/scan
     if jpeg_like:
