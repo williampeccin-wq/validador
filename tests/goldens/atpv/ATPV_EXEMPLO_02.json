@@ -1,14 +1,11 @@
 {
   "chassi": "9BD2651MHM9185242",
-  "comprador_cpf_cnpj": null,
+  "comprador_cpf_cnpj": "09628191900",
   "comprador_nome": "MARIA ODETE FERREIRA REBELLO COSJENES EMAL NAOINFORMADOGNAO INFO C OM",
   "data_venda": "01/10/2025",
   "debug": {
     "min_text_len_threshold": 800,
-    "missing_required": [
-      "vendedor_cpf_cnpj",
-      "comprador_cpf_cnpj"
-    ],
+    "missing_required": [],
     "mode": "ocr",
     "native_text_len": 0,
     "ocr_text_len": 1514,
@@ -24,6 +21,6 @@
   "renavam": "01262046804",
   "uf": "SC",
   "valor_venda": "65.000,00",
-  "vendedor_cpf_cnpj": null,
+  "vendedor_cpf_cnpj": "02934143945",
   "vendedor_nome": "MARIA ODETE FERREIRA REBELLO COSJENES EMAL NAOINFORMADOGNAO INFO C OM"
 }

@@ -4,7 +4,7 @@ import re
 import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pdfplumber
 
@@ -341,12 +341,6 @@ def _extract_municipio_uf(text: str) -> Optional[Tuple[str, str]]:
 # --------------------------
 
 def _is_plausible_vin(v: str) -> bool:
-    """
-    VIN plausível:
-    - 17 chars, sem I/O/Q (já garantido pelo regex)
-    - não pode ser só dígitos
-    - deve conter ao menos 1 letra e 1 dígito
-    """
     if not v or len(v) != 17:
         return False
     if v.isdigit():
@@ -357,10 +351,6 @@ def _is_plausible_vin(v: str) -> bool:
 
 
 def _extract_chassi(text: str) -> Optional[str]:
-    """
-    Extrai chassi (VIN) preferindo âncora CHASSI.
-    OCR costuma colocar VIN logo após 'CHASSI' ou 'CHASSI LOCAL'.
-    """
     t = _normalize_text(text)
 
     anchors = [
@@ -370,19 +360,132 @@ def _extract_chassi(text: str) -> Optional[str]:
     idx = _find_anchor_index(t, anchors)
     if idx >= 0:
         window = t[idx : idx + 220]
-        # pode haver VIN colado, então varremos todos candidatos e escolhemos o 1º plausível
         for m in _RE_CHASSI.finditer(window):
             vin = m.group(0)
             if _is_plausible_vin(vin):
                 return vin
 
-    # fallback: varredura global (pega 1º plausível)
     for m2 in _RE_CHASSI.finditer(t):
         vin2 = m2.group(0)
         if _is_plausible_vin(vin2):
             return vin2
 
     return None
+
+
+# --------------------------
+# CPF/CNPJ por âncora (vendedor/comprador) com exclusão
+# --------------------------
+
+def _is_plausible_cpf_cnpj(digits: str) -> bool:
+    """
+    Validação leve (bootstrap):
+    - tamanho 11 (CPF) ou 14 (CNPJ)
+    - não pode ser todos os dígitos iguais
+    """
+    if not digits:
+        return False
+    if len(digits) not in (11, 14):
+        return False
+    if len(set(digits)) == 1:
+        return False
+    return True
+
+
+def _pick_best_cpf_cnpj(
+    cands: List[str],
+    prefer_len: Optional[int],
+    *,
+    exclude: Optional[Set[str]] = None,
+) -> Optional[str]:
+    """
+    Seleciona o melhor candidato:
+    - filtra plausíveis
+    - remove excluídos (ex: CPF do vendedor ao extrair comprador)
+    - se prefer_len definido, tenta primeiro
+    - senão, pega o primeiro (ordem do texto)
+    """
+    ex = exclude or set()
+
+    good = []
+    for c in cands:
+        if not _is_plausible_cpf_cnpj(c):
+            continue
+        if c in ex:
+            continue
+        good.append(c)
+
+    if not good:
+        return None
+
+    if prefer_len in (11, 14):
+        for c in good:
+            if len(c) == prefer_len:
+                return c
+
+    return good[0]
+
+
+def _extract_cpf_cnpj_by_anchor(block: str, *, exclude: Optional[Set[str]] = None) -> Optional[str]:
+    """
+    Extrai CPF/CNPJ com prioridade por âncora 'CPF/CNPJ' dentro do bloco.
+    Tolerante a OCR (acentos, barras, espaços, hífens etc.), pois coletamos dígitos.
+    """
+    b = _normalize_text(block)
+
+    anchors = [
+        "CPF/CNPJ",
+        "CPF CNPJ",
+        "CPF",
+        "CNPJ",
+    ]
+    idx = _find_anchor_index(b, anchors)
+    if idx < 0:
+        return None
+
+    window = b[idx : idx + 220]
+
+    digit_runs = re.findall(r"\b\d[\d\.\-\/ ]{8,25}\d\b", window)
+    cands: List[str] = []
+    for run in digit_runs:
+        d = _only_digits(run)
+        if len(d) in (11, 14):
+            cands.append(d)
+
+    prefer_len: Optional[int] = None
+    if "CNPJ" in window and "CPF" not in window:
+        prefer_len = 14
+    elif "CPF" in window and "CNPJ" not in window:
+        prefer_len = 11
+
+    return _pick_best_cpf_cnpj(cands, prefer_len, exclude=exclude)
+
+
+def _extract_cpf_cnpj_fallback(block: str, *, exclude: Optional[Set[str]] = None) -> Optional[str]:
+    """
+    Fallback: varre o bloco inteiro e pega o primeiro plausível 11/14.
+    """
+    b = _normalize_text(block)
+    runs = re.findall(r"\b\d[\d\.\-\/ ]{8,35}\d\b", b)
+    cands: List[str] = []
+    for run in runs:
+        d = _only_digits(run)
+        if len(d) in (11, 14):
+            cands.append(d)
+
+    return _pick_best_cpf_cnpj(cands, prefer_len=None, exclude=exclude)
+
+
+def _extract_cpf_cnpj(block: str, *, exclude: Optional[Set[str]] = None) -> Optional[str]:
+    """
+    API interna:
+    1) tenta por âncora
+    2) fallback por varredura do bloco
+    """
+    got = _extract_cpf_cnpj_by_anchor(block, exclude=exclude)
+    if got:
+        return got
+    return _extract_cpf_cnpj_fallback(block, exclude=exclude)
 
 
 # --------------------------
@@ -400,7 +503,6 @@ def _parse_atpv_text(text: str, *, debug: Dict[str, Any]) -> AtpvResult:
     r.placa = _find_first(_RE_PLACA_MERCOSUL, t) or _find_first(_RE_PLACA_ANTIGA, t)
     r.renavam = _find_first(_RE_RENAVAM, t)
 
-    # CHASSI agora é por âncora
     r.chassi = _extract_chassi(t)
 
     r.valor_venda = _find_first(_RE_VALOR, t)
@@ -410,26 +512,28 @@ def _parse_atpv_text(text: str, *, debug: Dict[str, Any]) -> AtpvResult:
     if mun_uf:
         r.municipio, r.uf = mun_uf
 
+    # vendedor primeiro
     r.vendedor_cpf_cnpj = _extract_cpf_cnpj(vendedor_block)
-    r.vendedor_nome = _extract_nome_pos_label(vendedor_block, "NOME")
-
-    r.comprador_cpf_cnpj = _extract_cpf_cnpj(comprador_block)
-    r.comprador_nome = _extract_nome_pos_label(comprador_block, "NOME")
-
     if r.vendedor_cpf_cnpj:
         r.vendedor_cpf_cnpj = _only_digits(r.vendedor_cpf_cnpj)
+
+    # comprador: excluir CPF/CNPJ do vendedor
+    exclude_set: Set[str] = set()
+    if r.vendedor_cpf_cnpj:
+        exclude_set.add(r.vendedor_cpf_cnpj)
+
+    r.comprador_cpf_cnpj = _extract_cpf_cnpj(comprador_block, exclude=exclude_set)
     if r.comprador_cpf_cnpj:
         r.comprador_cpf_cnpj = _only_digits(r.comprador_cpf_cnpj)
+
+    # nomes
+    r.vendedor_nome = _extract_nome_pos_label(vendedor_block, "NOME")
+    r.comprador_nome = _extract_nome_pos_label(comprador_block, "NOME")
 
     r.vendedor_nome = _clean_nome(r.vendedor_nome)
     r.comprador_nome = _clean_nome(r.comprador_nome)
 
     return r
-
-
-def _extract_cpf_cnpj(block: str) -> Optional[str]:
-    m = re.search(r"\b\d{11,14}\b", _only_digits(block))
-    return m.group(0) if m else None
 
 
 def _extract_nome_pos_label(block: str, label: str) -> Optional[str]:
@@ -440,7 +544,7 @@ def _extract_nome_pos_label(block: str, label: str) -> Optional[str]:
 
     window = b[idx + len(label) : idx + 220]
     stop_tokens = [
-        "CPF", "CNPJ", "E-MAIL", "EMAIL", "PLACA", "RENAVAM", "CHASSI",
+        "CPF", "CNPJ", "CPF/CNPJ", "E-MAIL", "EMAIL", "PLACA", "RENAVAM", "CHASSI",
         "MUNICIPIO", "MUNICÍPIO", "UF", "ENDERECO", "ENDEREÇO",
         "DATA", "VALOR", "ANO",
     ]
