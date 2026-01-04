@@ -146,6 +146,8 @@ def _extract_image_ocr_text(img_path: Path) -> Tuple[str, List[Dict[str, Any]]]:
 _RE_PLACA_ANTIGA = re.compile(r"\b[A-Z]{3}\d{4}\b")
 _RE_PLACA_MERCOSUL = re.compile(r"\b[A-Z]{3}\d[A-Z0-9]\d{2}\b")
 _RE_RENAVAM = re.compile(r"\b\d{9,11}\b")
+
+# VIN / chassi: 17 chars, sem I/O/Q
 _RE_CHASSI = re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b")
 
 _RE_UF = re.compile(r"\b[A-Z]{2}\b")
@@ -236,13 +238,11 @@ def _extract_section(text: str, start_anchor: str, end_anchor: str) -> str:
 # UF / Município robustos
 # --------------------------
 
-# UFs válidas no Brasil (para não aceitar "CR", "BR", etc.)
 _UF_VALIDAS = {
     "AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG", "MS", "MT",
     "PA", "PB", "PE", "PI", "PR", "RJ", "RN", "RO", "RR", "RS", "SC", "SE", "SP", "TO",
 }
 
-# tokens que são claramente labels e não município
 _MUNICIPIO_BAD_TOKENS = {
     "MUNICIPIO", "MUNICÍPIO", "DE", "DOMICILIO", "DOMICÍLIO", "OU", "RESIDENCIA", "RESIDÊNCIA",
     "UF", "ENDERECO", "ENDEREÇO", "DO", "DA", "DOS", "DAS",
@@ -252,16 +252,9 @@ _PREPOSICOES_2L = {"DE", "DA", "DO", "EM"}
 
 
 def _sanitize_municipio_tokens(tokens: List[str]) -> List[str]:
-    """
-    Remove sujeiras comuns no início do município (OCR).
-    Ex: 'UR PORTO BELO' -> 'PORTO BELO'
-    Regra: se primeiro token tem 2 letras e NÃO é UF válida e NÃO é preposição, remove.
-    Também remove explicitamente UR/UF.
-    """
     if not tokens:
         return tokens
 
-    # remove UR/UF explícitos no começo
     while tokens and tokens[0] in {"UR", "UF"}:
         tokens = tokens[1:]
 
@@ -274,11 +267,6 @@ def _sanitize_municipio_tokens(tokens: List[str]) -> List[str]:
 
 
 def _extract_municipio_uf_from_anchor(text: str) -> Optional[Tuple[str, str]]:
-    """
-    Extrai município/UF preferindo âncora completa:
-    'MUNICÍPIO DE DOMICÍLIO OU RESIDÊNCIA UF'
-    e pegando a janela logo depois, que é onde os dados aparecem no ATPV-e.
-    """
     t = _normalize_text(text)
 
     anchors = [
@@ -349,6 +337,55 @@ def _extract_municipio_uf(text: str) -> Optional[Tuple[str, str]]:
 
 
 # --------------------------
+# Chassi (VIN) robusto por âncora
+# --------------------------
+
+def _is_plausible_vin(v: str) -> bool:
+    """
+    VIN plausível:
+    - 17 chars, sem I/O/Q (já garantido pelo regex)
+    - não pode ser só dígitos
+    - deve conter ao menos 1 letra e 1 dígito
+    """
+    if not v or len(v) != 17:
+        return False
+    if v.isdigit():
+        return False
+    has_alpha = any(c.isalpha() for c in v)
+    has_digit = any(c.isdigit() for c in v)
+    return has_alpha and has_digit
+
+
+def _extract_chassi(text: str) -> Optional[str]:
+    """
+    Extrai chassi (VIN) preferindo âncora CHASSI.
+    OCR costuma colocar VIN logo após 'CHASSI' ou 'CHASSI LOCAL'.
+    """
+    t = _normalize_text(text)
+
+    anchors = [
+        "CHASSI LOCAL",
+        "CHASSI",
+    ]
+    idx = _find_anchor_index(t, anchors)
+    if idx >= 0:
+        window = t[idx : idx + 220]
+        # pode haver VIN colado, então varremos todos candidatos e escolhemos o 1º plausível
+        for m in _RE_CHASSI.finditer(window):
+            vin = m.group(0)
+            if _is_plausible_vin(vin):
+                return vin
+
+    # fallback: varredura global (pega 1º plausível)
+    for m2 in _RE_CHASSI.finditer(t):
+        vin2 = m2.group(0)
+        if _is_plausible_vin(vin2):
+            return vin2
+
+    return None
+
+
+# --------------------------
 # Main parse
 # --------------------------
 
@@ -362,9 +399,11 @@ def _parse_atpv_text(text: str, *, debug: Dict[str, Any]) -> AtpvResult:
 
     r.placa = _find_first(_RE_PLACA_MERCOSUL, t) or _find_first(_RE_PLACA_ANTIGA, t)
     r.renavam = _find_first(_RE_RENAVAM, t)
-    r.chassi = _find_first(_RE_CHASSI, t)
-    r.valor_venda = _find_first(_RE_VALOR, t)
 
+    # CHASSI agora é por âncora
+    r.chassi = _extract_chassi(t)
+
+    r.valor_venda = _find_first(_RE_VALOR, t)
     r.data_venda = _extract_data_venda(t)
 
     mun_uf = _extract_municipio_uf(vendedor_block) or _extract_municipio_uf(t)
