@@ -1,15 +1,15 @@
 {
   "chassi": "9BD2651MHM9185242",
-  "comprador_cpf_cnpj": "41100508656",
-  "comprador_nome": "MARIA ODETE FERREIRA REBELLO",
+  "comprador_cpf_cnpj": null,
+  "comprador_nome": "MARIA ODETE FERREIRA REBELLO COSJENES EMAL NAOINFORMADOGNAO INFO C OM MUNICÍPIO DE DOMICÍLIO OU RESIDÊNCIA UR PORTO BELO SC VALOR DECLARADO NA VENDA R AUTORIZO O Ó",
   "data_venda": "01/10/2025",
   "debug": {
     "min_text_len_threshold": 800,
+    "missing_required": [
+      "vendedor_cpf_cnpj",
+      "comprador_cpf_cnpj"
+    ],
     "mode": "ocr",
-    "mode_decision": {
-      "chosen": "ocr",
-      "reason": "image_input"
-    },
     "native_text_len": 0,
     "ocr_text_len": 1514,
     "pages": [
@@ -19,11 +19,11 @@
       }
     ]
   },
-  "municipio": "SENATRAN\n\nDETRAN",
+  "municipio": "DE DOMICÍLIO OU RESIDÊNCIA UR PORTO BELO SC VALOR DECLARADO NA VENDA R AUTORIZO O ÓRGÃO OU ENTIDADE EXECUTIVO DE TRÂNITO DOS ESTADOS OU",
   "placa": "RMW8F32",
   "renavam": "01262046804",
-  "uf": "SC",
+  "uf": "DO",
   "valor_venda": "65.000,00",
-  "vendedor_cpf_cnpj": "01262046804",
-  "vendedor_nome": "MARIA ODETE FERREIRA REBELLO"
+  "vendedor_cpf_cnpj": null,
+  "vendedor_nome": "MARIA ODETE FERREIRA REBELLO COSJENES EMAL NAOINFORMADOGNAO INFO C OM MUNICÍPIO DE DOMICÍLIO OU RESIDÊNCIA UR PORTO BELO SC VALOR DECLARADO NA VENDA R AUTORIZO O Ó"
 }

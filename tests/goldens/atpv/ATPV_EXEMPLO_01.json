@@ -1,31 +1,35 @@
 {
-  "chassi": "3FA6P0HT0ER383441",
-  "comprador_cpf_cnpj": "40670106204",
-  "comprador_nome": "LETICIA FIGUEIREDO GERONIMO",
-  "data_venda": "17/11/2025",
+  "chassi": null,
+  "comprador_cpf_cnpj": null,
+  "comprador_nome": null,
+  "data_venda": null,
   "debug": {
     "min_text_len_threshold": 800,
-    "mode": "ocr",
-    "mode_decision": {
-      "chosen": "ocr",
-      "native_len": 1711,
-      "native_quality_ok": false,
-      "reason": "native_quality_bad_forced_ocr"
-    },
+    "missing_required": [
+      "placa",
+      "renavam",
+      "chassi",
+      "vendedor_cpf_cnpj",
+      "comprador_nome",
+      "comprador_cpf_cnpj",
+      "data_venda",
+      "valor_venda"
+    ],
+    "mode": "native",
     "native_text_len": 1711,
-    "ocr_text_len": 1530,
+    "ocr_text_len": 0,
     "pages": [
       {
-        "ocr_len": 1530,
+        "native_len": 1711,
         "page": 1
       }
     ]
   },
-  "municipio": "SENATRAN\n\nDETRAN",
-  "placa": "FSL4J46",
-  "renavam": "01019706659",
-  "uf": "SC",
-  "valor_venda": "64.758,00",
-  "vendedor_cpf_cnpj": "01019706659",
-  "vendedor_nome": "MARA REGINA ALBRECHT"
+  "municipio": "DE DOMICÍLIO OU RESIDÊNCIA UF ANO FABRICAÇÃO ANO MODELO VALOR DECLARADO NA VENDA R MARCA MODELO VERSÃO AUTORIZO O ÓRGÃO OU EN DADE EXECU VO DE TRÂNSITO DOS ESTADOS OU",
+  "placa": null,
+  "renavam": null,
+  "uf": "DO",
+  "valor_venda": null,
+  "vendedor_cpf_cnpj": null,
+  "vendedor_nome": "CÓDIGO RENAVAM CPF CNPJ E MAIL PLACA MUNICÍPIO DE DOMICÍLIO OU RESIDÊNCIA UF ANO FABRICAÇÃO ANO MODELO VALOR DECLARADO NA VENDA R MARCA MODELO VERSÃO AUTORIZO O ÓRGÃO OU EN DADE EXECU VO DE"
 }
