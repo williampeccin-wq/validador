@@ -9,6 +9,7 @@
       "placa",
       "renavam",
       "chassi",
+      "vendedor_nome",
       "vendedor_cpf_cnpj",
       "comprador_nome",
       "comprador_cpf_cnpj",
@@ -31,5 +32,5 @@
   "uf": "DO",
   "valor_venda": null,
   "vendedor_cpf_cnpj": null,
-  "vendedor_nome": "CÓDIGO RENAVAM CPF CNPJ E MAIL PLACA MUNICÍPIO DE DOMICÍLIO OU RESIDÊNCIA UF ANO FABRICAÇÃO ANO MODELO VALOR DECLARADO NA VENDA R MARCA MODELO VERSÃO AUTORIZO O ÓRGÃO OU EN DADE EXECU VO DE"
+  "vendedor_nome": null
 }
