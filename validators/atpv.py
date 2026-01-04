@@ -1,4 +1,3 @@
-# validators/atpv.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 
 # =========================
-# Tipos / Resultado
+# Resultado
 # =========================
 
 @dataclass(frozen=True)
@@ -19,164 +18,167 @@ class ValidationResult:
 
 
 # =========================
-# Normalização de chaves
+# Regras de contrato (hard)
 # =========================
-
 REQUIRED_FIELDS = (
     "placa",
     "renavam",
     "chassi",
-    "comprador_cpf_cnpj",
-    "data_venda",
     "valor_venda",
+    "comprador_cpf_cnpj",
+    "comprador_nome",
+    "vendedor_nome",
 )
 
 _PLATE_RE = re.compile(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$")  # Mercosul/antiga compat
 _VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")  # VIN 17 chars, exclui I,O,Q
 
-# Aceita dd/mm/aaaa
+# Nome humano simples: >= 2 tokens, apenas letras/acentos/espaços
+_NAME_CHARS_RE = re.compile(r"[^A-ZÀ-Ü ]")
+_NAME_OK_RE = re.compile(r"^[A-ZÀ-Ü ]+$")
+
+_BAD_NAME_SNIPPETS = (
+    "IDENTIFICAÇÃO DO VENDEDOR",
+    "IDENTIFICACAO DO VENDEDOR",
+    "IDENTIFICAÇÃO DO COMPRADOR",
+    "IDENTIFICACAO DO COMPRADOR",
+    "O REGISTRO DESTE VEÍCULO",
+    "O REGISTRO DESTE VEICULO",
+    "CÓDIGO RENAVAM",
+    "CODIGO RENAVAM",
+    "COR PREDOMINANTE",
+    "CHASSI LOCAL",
+    "PLACA",
+    "RENAVAM",
+    "VALOR",
+    "MUNICÍPIO",
+    "MUNICIPIO",
+)
+
+# Aceita dd/mm/aaaa (se você voltar a usar datas em outra camada)
 _DATE_FMT = "%d/%m/%Y"
 
 
 def validate_atpv(parsed: Dict[str, Any]) -> ValidationResult:
     """
-    Validação dura (hard fail) para ATPV.
-
-    Obrigatórios:
-      - placa
-      - renavam
-      - chassi
-      - comprador_cpf_cnpj
-      - data_venda
-      - valor_venda
-
-    Retorna:
-      - is_valid
-      - errors (lista de strings estáveis)
-      - normalized (campos normalizados)
+    Validador duro para ATPV (camada de consistência + DV):
+      - RENAVAM: zfill(11) se 9/10, valida DV se 11
+      - CPF/CNPJ: valida DV conforme tamanho
+      - nomes: valida "nome humano"
+      - regras cruzadas: renavam_is_cpf, renavam_equals_comprador_doc
     """
     normalized = _normalize_keys(parsed)
-
     errors: List[str] = []
 
-    # 1) Obrigatórios: presença + não vazio
-    missing = [k for k in REQUIRED_FIELDS if not _has_value(normalized.get(k))]
-    if missing:
-        for k in missing:
+    # 1) Presença obrigatória
+    for k in REQUIRED_FIELDS:
+        if not _has_value(normalized.get(k)):
             errors.append(f"missing_required:{k}")
 
     # 2) Placa
-    placa = normalized.get("placa")
-    if _has_value(placa):
-        placa_n = _normalize_placa(str(placa))
-        normalized["placa"] = placa_n
-        if not _PLATE_RE.match(placa_n):
+    if _has_value(normalized.get("placa")):
+        placa = _normalize_placa(str(normalized["placa"]))
+        normalized["placa"] = placa
+        if not _PLATE_RE.match(placa):
             errors.append("invalid:placa_format")
 
-    # 3) CPF/CNPJ comprador
-    doc = normalized.get("comprador_cpf_cnpj")
-    if _has_value(doc):
-        doc_n = _only_digits(str(doc))
-        normalized["comprador_cpf_cnpj"] = doc_n
-        if len(doc_n) == 11:
-            if not _is_valid_cpf(doc_n):
+    # 3) Chassi (VIN)
+    if _has_value(normalized.get("chassi")):
+        chassi = _normalize_vin(str(normalized["chassi"]))
+        normalized["chassi"] = chassi
+        if not _VIN_RE.match(chassi):
+            errors.append("invalid:chassi_vin_format")
+
+    # 4) Valor venda
+    if _has_value(normalized.get("valor_venda")):
+        v = _parse_brl_money(normalized["valor_venda"])
+        if v is None:
+            errors.append("invalid:valor_venda_format")
+        else:
+            if v <= 0:
+                errors.append("invalid:valor_venda_nonpositive")
+            normalized["valor_venda"] = v
+
+    # 5) Nome comprador
+    if _has_value(normalized.get("comprador_nome")):
+        cn = _normalize_name(str(normalized["comprador_nome"]))
+        normalized["comprador_nome"] = cn
+        if not _is_human_name(cn):
+            errors.append("invalid:comprador_nome")
+
+    # 6) Nome vendedor
+    if _has_value(normalized.get("vendedor_nome")):
+        vn = _normalize_name(str(normalized["vendedor_nome"]))
+        normalized["vendedor_nome"] = vn
+        if not _is_human_name(vn):
+            errors.append("invalid:vendedor_nome")
+
+    # 7) CPF/CNPJ comprador (DV)
+    comprador_doc_raw = normalized.get("comprador_cpf_cnpj")
+    if _has_value(comprador_doc_raw):
+        comprador_doc = _only_digits(str(comprador_doc_raw))
+        normalized["comprador_cpf_cnpj"] = comprador_doc
+        if len(comprador_doc) == 11:
+            if not _is_valid_cpf(comprador_doc):
                 errors.append("invalid:comprador_cpf")
-        elif len(doc_n) == 14:
-            if not _is_valid_cnpj(doc_n):
+        elif len(comprador_doc) == 14:
+            if not _is_valid_cnpj(comprador_doc):
                 errors.append("invalid:comprador_cnpj")
         else:
             errors.append("invalid:comprador_cpf_cnpj_len")
 
-    # 4) RENAVAM
-    renavam = normalized.get("renavam")
-    if _has_value(renavam):
-        ren_n = _only_digits(str(renavam))
-        normalized["renavam"] = ren_n
+    # 8) RENAVAM: zfill + DV
+    renavam_raw = normalized.get("renavam")
+    renavam_norm: Optional[str] = None
+    if _has_value(renavam_raw):
+        renavam_norm = _normalize_renavam_to_11(str(renavam_raw))
+        normalized["renavam"] = renavam_norm
 
-        # RENAVAM não pode ser CPF/CNPJ válido (mesmo número)
-        if len(ren_n) == 11 and _is_valid_cpf(ren_n):
-            errors.append("invalid:renavam_is_cpf")
-        if len(ren_n) == 14 and _is_valid_cnpj(ren_n):
-            errors.append("invalid:renavam_is_cnpj")
-
-        # Regra estrutural (aceita 9-11; se 11 valida DV)
-        if len(ren_n) not in (9, 10, 11):
+        if renavam_norm is None:
             errors.append("invalid:renavam_len")
-        elif len(ren_n) == 11:
-            if not _is_valid_renavam_11(ren_n):
+        else:
+            # Agora é 11 => valida DV
+            if not _is_valid_renavam_11(renavam_norm):
                 errors.append("invalid:renavam_checkdigit")
 
-    # 4.5) Conflito cruzado: RENAVAM não pode ser igual ao doc do comprador,
-    # mesmo que o doc esteja inválido como CPF/CNPJ.
-    if _has_value(normalized.get("renavam")) and _has_value(normalized.get("comprador_cpf_cnpj")):
-        if str(normalized["renavam"]) == str(normalized["comprador_cpf_cnpj"]):
-            errors.append("invalid:renavam_equals_comprador_doc")
+            # Se RENAVAM também for CPF válido => fortíssimo sinal de campo trocado
+            if _is_valid_cpf(renavam_norm):
+                errors.append("invalid:renavam_is_cpf")
 
-    # 5) Chassi (VIN)
-    chassi = normalized.get("chassi")
-    if _has_value(chassi):
-        vin = _normalize_vin(str(chassi))
-        normalized["chassi"] = vin
-        if not _VIN_RE.match(vin):
-            errors.append("invalid:chassi_vin_format")
-
-    # 6) Data venda (dd/mm/aaaa)
-    data_venda = normalized.get("data_venda")
-    if _has_value(data_venda):
-        dv = str(data_venda).strip()
-        if not _is_valid_date(dv):
-            errors.append("invalid:data_venda_format")
-        else:
-            normalized["data_venda"] = dv
-
-    # 7) Valor venda (decimal > 0)
-    valor_venda = normalized.get("valor_venda")
-    if _has_value(valor_venda):
-        parsed_val = _parse_brl_money(valor_venda)
-        if parsed_val is None:
-            errors.append("invalid:valor_venda_format")
-        else:
-            if parsed_val <= 0:
-                errors.append("invalid:valor_venda_nonpositive")
-            normalized["valor_venda"] = parsed_val
+    # 9) Regras cruzadas
+    comprador_doc = normalized.get("comprador_cpf_cnpj")
+    if renavam_norm and comprador_doc and renavam_norm == comprador_doc:
+        errors.append("invalid:renavam_equals_comprador_doc")
 
     return ValidationResult(is_valid=(len(errors) == 0), errors=errors, normalized=normalized)
 
 
+# =========================
+# Normalização de chaves
+# =========================
+
 def _normalize_keys(parsed: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Converte outputs heterogêneos do parser em um schema canonical.
-    Não inventa valores: apenas mapeia chaves existentes.
-    """
     out = dict(parsed) if isinstance(parsed, dict) else {}
 
-    # Canonical: comprador_cpf_cnpj
+    # Canonical comprador_cpf_cnpj
     if not _has_value(out.get("comprador_cpf_cnpj")):
-        # alguns outputs têm cpf/cnpj soltos
         if _has_value(out.get("cpf")):
             out["comprador_cpf_cnpj"] = out.get("cpf")
         elif _has_value(out.get("cnpj")):
             out["comprador_cpf_cnpj"] = out.get("cnpj")
 
-    # Canonical: data_venda
-    if not _has_value(out.get("data_venda")):
-        for k in ("data_compra", "data_venda_compra", "data_transacao", "data"):
-            if _has_value(out.get(k)):
-                out["data_venda"] = out.get(k)
-                break
-
-    # Canonical: valor_venda
-    if not _has_value(out.get("valor_venda")):
-        for k in ("valor_compra", "valor_transacao", "valor"):
-            if _has_value(out.get(k)):
-                out["valor_venda"] = out.get(k)
-                break
-
-    # Canonical: chassi
+    # Canonical chassi
     if not _has_value(out.get("chassi")):
         for k in ("vin", "numero_chassi"):
             if _has_value(out.get(k)):
                 out["chassi"] = out.get(k)
+                break
+
+    # Canonical valor_venda
+    if not _has_value(out.get("valor_venda")):
+        for k in ("valor_compra", "valor_transacao", "valor"):
+            if _has_value(out.get(k)):
+                out["valor_venda"] = out.get(k)
                 break
 
     return out
@@ -206,12 +208,29 @@ def _normalize_vin(s: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", s.upper().strip())
 
 
-def _is_valid_date(s: str) -> bool:
-    try:
-        datetime.strptime(s.strip(), _DATE_FMT)
-        return True
-    except Exception:
+def _normalize_name(s: str) -> str:
+    s = s.strip().upper()
+    s = _NAME_CHARS_RE.sub(" ", s)
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    return s
+
+
+def _is_human_name(s: str) -> bool:
+    if not s:
         return False
+    if len(s) < 8:
+        return False
+    if any(bad in s for bad in _BAD_NAME_SNIPPETS):
+        return False
+    if not _NAME_OK_RE.match(s):
+        return False
+    parts = [p for p in s.split(" ") if p]
+    if len(parts) < 2:
+        return False
+    # pelo menos 2 tokens com tamanho razoável
+    if sum(1 for p in parts if len(p) >= 2) < 2:
+        return False
+    return True
 
 
 def _parse_brl_money(v: Any) -> Optional[float]:
@@ -233,7 +252,6 @@ def _parse_brl_money(v: Any) -> Optional[float]:
     s = s.replace("R$", "").strip()
     s = re.sub(r"\s+", "", s)
 
-    # "1.234,56" -> "1234.56"
     if "," in s:
         s = s.replace(".", "")
         s = s.replace(",", ".")
@@ -244,7 +262,7 @@ def _parse_brl_money(v: Any) -> Optional[float]:
 
 
 # =========================
-# CPF / CNPJ
+# CPF / CNPJ (DV público)
 # =========================
 
 def _is_valid_cpf(cpf: str) -> bool:
@@ -285,17 +303,31 @@ def _is_valid_cnpj(cnpj: str) -> bool:
 
 
 # =========================
-# RENAVAM (11 dígitos)
+# RENAVAM (normalização + DV)
 # =========================
+
+def _normalize_renavam_to_11(value: str) -> Optional[str]:
+    """
+    Regra do usuário:
+      - 9 dígitos  -> zfill(11) (2 zeros à esquerda)
+      - 10 dígitos -> zfill(11) (1 zero à esquerda)
+      - 11 dígitos -> mantém
+      - demais -> None
+    """
+    d = _only_digits(value)
+    if len(d) in (9, 10):
+        return d.zfill(11)
+    if len(d) == 11:
+        return d
+    return None
+
 
 def _is_valid_renavam_11(ren: str) -> bool:
     """
-    Validação de DV para RENAVAM 11 dígitos.
-
-    Algoritmo:
-      - pega os 10 primeiros dígitos
-      - aplica pesos 2..9 repetindo da direita p/ esquerda
-      - soma, mod 11; dv = (11 - mod) % 11; se dv == 10 -> 0
+    DV RENAVAM 11 dígitos (método comum):
+      - usa os 10 primeiros dígitos
+      - pesos 2..9 repetindo da direita p/ esquerda
+      - dv = (11 - (soma % 11)) % 11; se dv==10 -> 0
     """
     ren = _only_digits(ren)
     if len(ren) != 11:
