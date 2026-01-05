@@ -3,6 +3,26 @@
   "comprador_cpf_cnpj": "01262046804",
   "comprador_nome": null,
   "debug": {
+    "checks": {
+      "comprador_cpf_cnpj": {
+        "dv_ok": false,
+        "normalized": "01262046804",
+        "raw": "01262046804",
+        "reason": "dv_mismatch"
+      },
+      "renavam": {
+        "dv_ok": false,
+        "normalized": "",
+        "raw": null,
+        "reason": "empty"
+      },
+      "vendedor_cpf_cnpj": {
+        "dv_ok": false,
+        "normalized": "01262046804",
+        "raw": "01262046804",
+        "reason": "dv_mismatch"
+      }
+    },
     "min_text_len_threshold": 800,
     "mode": "native",
     "native_text_len": 1475,
@@ -14,12 +34,16 @@
         "ocr_len": 0,
         "page": 1
       }
+    ],
+    "warnings": [
+      "CPF_VENDEDOR DV inválido (extraído='01262046804')",
+      "CPF_COMPRADOR DV inválido (extraído='01262046804')"
     ]
   },
   "mode": "native",
   "placa": "RMW8F32",
   "renavam": null,
   "valor_venda": "R$ 65.000,00",
-  "vendedor_cpf_cnpj": null,
+  "vendedor_cpf_cnpj": "01262046804",
   "vendedor_nome": null
 }

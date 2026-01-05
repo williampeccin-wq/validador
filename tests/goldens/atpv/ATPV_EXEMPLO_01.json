@@ -3,6 +3,26 @@
   "comprador_cpf_cnpj": null,
   "comprador_nome": null,
   "debug": {
+    "checks": {
+      "comprador_cpf_cnpj": {
+        "dv_ok": false,
+        "normalized": "",
+        "raw": null,
+        "reason": "empty"
+      },
+      "renavam": {
+        "dv_ok": false,
+        "normalized": "",
+        "raw": null,
+        "reason": "empty"
+      },
+      "vendedor_cpf_cnpj": {
+        "dv_ok": false,
+        "normalized": "",
+        "raw": null,
+        "reason": "empty"
+      }
+    },
     "min_text_len_threshold": 800,
     "mode": "native",
     "native_text_len": 1711,
@@ -14,7 +34,8 @@
         "ocr_len": 0,
         "page": 1
       }
-    ]
+    ],
+    "warnings": []
   },
   "mode": "native",
   "placa": null,

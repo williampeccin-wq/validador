@@ -60,7 +60,7 @@ def analyze_atpv(
             }
         )
 
-    return {
+    out: Dict[str, Any] = {
         **extracted,
         "mode": mode,
         "debug": {
@@ -73,9 +73,22 @@ def analyze_atpv(
         },
     }
 
+    # ============================================================
+    # Blindagem de sanidade: checks/warnings SEMPRE presentes
+    # e cross-check DV (CPF/RENAVAM) SEM bloquear extração
+    # ============================================================
+    dbg = out.setdefault("debug", {})
+    dbg.setdefault("checks", {})
+    dbg.setdefault("warnings", [])
+
+    _run_soft_dv_checks(out)
+
+    return out
+
 
 def _extract_native_text(pdf_path: str) -> Tuple[str, List[int]]:
     import pdfplumber
+
     texts, lens = [], []
     with pdfplumber.open(pdf_path) as pdf:
         for p in pdf.pages:
@@ -126,7 +139,7 @@ def _extract_fields(text: str) -> Dict[str, Any]:
         "comprador_nome": comprador_nome,
         "vendedor_nome": vendedor_nome,
         "comprador_cpf_cnpj": _only_digits(comprador_doc) if comprador_doc else None,
-        "vendedor_cpf_cnpj": None,
+        "vendedor_cpf_cnpj": _only_digits(vendedor_doc) if vendedor_doc else None,
     }
 
 
@@ -206,3 +219,119 @@ def _money_in_line(lines: List[str], key: str) -> Optional[str]:
             if m:
                 return m.group(0)
     return None
+
+
+# =========================
+# DV cross-check (soft): CPF + RENAVAM
+# =========================
+
+def _cpf_is_valid(cpf_digits: str) -> Tuple[bool, str]:
+    """
+    cpf_digits: apenas dígitos.
+    Retorna (ok, reason): ok|empty|bad_length|all_equal|dv_mismatch|not_applicable
+    """
+    d = _only_digits(cpf_digits or "")
+    if not d:
+        return False, "empty"
+    if len(d) != 11:
+        # Não é CPF (pode ser CNPJ, ou lixo). Não gera warning.
+        return False, "bad_length"
+    if d == d[0] * 11:
+        return False, "all_equal"
+
+    nums = [int(x) for x in d]
+
+    s1 = sum(nums[i] * (10 - i) for i in range(9))
+    dv1 = (s1 * 10) % 11
+    dv1 = 0 if dv1 == 10 else dv1
+
+    s2 = sum(nums[i] * (11 - i) for i in range(10))
+    dv2 = (s2 * 10) % 11
+    dv2 = 0 if dv2 == 10 else dv2
+
+    if nums[9] == dv1 and nums[10] == dv2:
+        return True, "ok"
+    return False, "dv_mismatch"
+
+
+def _renavam_is_valid(renavam_digits: str) -> Tuple[bool, str]:
+    """
+    renavam_digits: apenas dígitos.
+    Retorna (ok, reason): ok|empty|bad_length|dv_mismatch
+    """
+    d = _only_digits(renavam_digits or "")
+    if not d:
+        return False, "empty"
+    if len(d) != 11:
+        return False, "bad_length"
+
+    base = d[:10]
+    dv_expected = int(d[10])
+
+    weights = [2, 3, 4, 5, 6, 7, 8, 9]
+    total = 0
+    w_idx = 0
+    for ch in reversed(base):
+        total += int(ch) * weights[w_idx]
+        w_idx = (w_idx + 1) % len(weights)
+
+    mod = total % 11
+    dv_calc = 11 - mod
+    if dv_calc >= 10:
+        dv_calc = 0
+
+    if dv_calc == dv_expected:
+        return True, "ok"
+    return False, "dv_mismatch"
+
+
+def _run_soft_dv_checks(out: Dict[str, Any]) -> None:
+    """
+    Anota em debug.checks e debug.warnings sem bloquear extração.
+    Garante determinismo e presença das chaves.
+    """
+    dbg = out.setdefault("debug", {})
+    checks: Dict[str, Any] = dbg.setdefault("checks", {})
+    warnings: List[str] = dbg.setdefault("warnings", [])
+
+    # Ordem determinística
+    keys = ("vendedor_cpf_cnpj", "comprador_cpf_cnpj", "renavam")
+
+    for k in keys:
+        raw = out.get(k)
+        raw_str = "" if raw is None else str(raw)
+        norm = _only_digits(raw_str)
+
+        if k == "renavam":
+            ok, reason = _renavam_is_valid(norm)
+            checks[k] = {
+                "raw": raw,
+                "normalized": norm,
+                "dv_ok": bool(ok),
+                "reason": reason,
+            }
+
+            # Warning só quando existe valor e é realmente um problema de RENAVAM
+            if norm and not ok and reason in ("bad_length", "dv_mismatch"):
+                if reason == "bad_length":
+                    warnings.append(f"RENAVAM com tamanho inválido (extraído='{raw_str}')")
+                else:
+                    warnings.append(f"RENAVAM DV inválido (extraído='{raw_str}')")
+
+        else:
+            # Campo cpf_cnpj: validamos CPF apenas quando 11 dígitos; se não for 11, não avisamos
+            ok, reason = _cpf_is_valid(norm)
+            checks[k] = {
+                "raw": raw,
+                "normalized": norm,
+                "dv_ok": bool(ok),
+                "reason": reason,
+            }
+
+            # Warning apenas se parecer CPF (11 dígitos) e falhar de verdade
+            if norm and len(norm) == 11 and not ok and reason in ("all_equal", "dv_mismatch"):
+                label = "CPF_VENDEDOR" if k == "vendedor_cpf_cnpj" else "CPF_COMPRADOR"
+                if reason == "all_equal":
+                    warnings.append(f"{label} inválido (dígitos repetidos) (extraído='{raw_str}')")
+                else:
+                    warnings.append(f"{label} DV inválido (extraído='{raw_str}')")
