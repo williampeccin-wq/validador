@@ -1,16 +1,14 @@
+# orchestrator/phase2_runner.py
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from validators.phase2.proposta_cnh_validator import build_proposta_cnh_report
-
-
-# =============================================================================
-# Types
-# =============================================================================
+from validators.phase2.cnh_validity_validator import build_cnh_validity_report
 
 JsonDict = Dict[str, Any]
 
@@ -18,132 +16,162 @@ JsonDict = Dict[str, Any]
 @dataclass(frozen=True)
 class Phase2RunResult:
     case_id: str
-    proposta_json_path: Optional[Path]
-    cnh_json_path: Optional[Path]
-    report_path: Optional[Path]
+    report_path: Path
     report: JsonDict
 
+    # 🔒 CONTRATO PÚBLICO (mantido)
+    proposta_json_path: Optional[str]
+    cnh_json_path: Optional[str]
 
-# =============================================================================
-# Helpers
-# =============================================================================
-
-def _load_json(path: Path) -> JsonDict:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    # extra (novo, não quebra testes)
+    inputs: Dict[str, Optional[str]]
 
 
-def _write_json(path: Path, data: JsonDict) -> None:
+def _read_json(path: Path) -> JsonDict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: JsonDict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=False)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _pick_latest_json_in_dir(dir_path: Path) -> Optional[Path]:
-    """
-    Retorna o arquivo .json mais recente (por mtime) dentro do diretório.
-    Se não existir, retorna None.
-    """
+def _latest_json_in_dir(dir_path: Path) -> Optional[Path]:
     if not dir_path.exists() or not dir_path.is_dir():
         return None
+    files = sorted(dir_path.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return files[0] if files else None
 
-    candidates = [p for p in dir_path.glob("*.json") if p.is_file()]
-    if not candidates:
+
+def _load_latest_phase1_doc(
+    *,
+    storage_root: Path,
+    case_id: str,
+    document_type: str,
+) -> Optional[JsonDict]:
+    doc_dir = storage_root / "phase1" / case_id / document_type
+    latest = _latest_json_in_dir(doc_dir)
+    if latest is None:
         return None
-
-    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return candidates[0]
-
-
-def _safe_read_json(path: Optional[Path]) -> Tuple[JsonDict, Optional[str]]:
-    """
-    Nunca levanta exceção para o caller.
-    Retorna (data, error_str).
-    """
-    if path is None:
-        return {}, "missing_input_path"
-
-    try:
-        return _load_json(path), None
-    except Exception as e:
-        return {}, f"read_error: {type(e).__name__}: {e}"
+    return _read_json(latest)
 
 
 # =============================================================================
-# Public API
+# Phase 2 — Proposta ↔ CNH
 # =============================================================================
 
 def run_phase2_proposta_cnh(
     *,
     case_id: str,
-    storage_root: Path = Path("./storage"),
+    storage_root: Path = Path("storage"),
     write_report: bool = True,
 ) -> Phase2RunResult:
-    """
-    Fase 2 (início): validação Proposta ↔ CNH gerando somente relatório explicável.
-    Regras:
-      - NÃO bloqueia fluxo (não levanta por divergência ou ausência)
-      - NÃO decide aprovado/reprovado
-      - Usa SOMENTE JSONs persistidos na Fase 1
-    """
-    phase1_case_dir = storage_root / "phase1" / case_id
+    proposta_doc = _load_latest_phase1_doc(
+        storage_root=storage_root,
+        case_id=case_id,
+        document_type="proposta_daycoval",
+    )
+    cnh_doc = _load_latest_phase1_doc(
+        storage_root=storage_root,
+        case_id=case_id,
+        document_type="cnh",
+    )
 
-    proposta_dir = phase1_case_dir / "proposta_daycoval"
-    cnh_dir = phase1_case_dir / "cnh"
+    proposta_json_path: Optional[str] = None
+    cnh_json_path: Optional[str] = None
 
-    proposta_json_path = _pick_latest_json_in_dir(proposta_dir)
-    cnh_json_path = _pick_latest_json_in_dir(cnh_dir)
+    proposta_data: Dict[str, Any] = {}
+    cnh_data: Dict[str, Any] = {}
 
-    proposta_data, proposta_err = _safe_read_json(proposta_json_path)
-    cnh_data, cnh_err = _safe_read_json(cnh_json_path)
+    if proposta_doc is not None:
+        proposta_json_path = str(
+            (storage_root / "phase1" / case_id / "proposta_daycoval").resolve()
+        )
+        proposta_data = proposta_doc.get("data") or {}
 
-    meta: JsonDict = {
+    if cnh_doc is not None:
+        cnh_json_path = str(
+            (storage_root / "phase1" / case_id / "cnh").resolve()
+        )
+        cnh_data = cnh_doc.get("data") or {}
+
+    meta = {
         "inputs": {
-            "phase1_case_dir": str(phase1_case_dir),
-            "proposta_json_path": str(proposta_json_path) if proposta_json_path else None,
-            "cnh_json_path": str(cnh_json_path) if cnh_json_path else None,
-        },
-        "input_errors": {
-            "proposta": proposta_err,
-            "cnh": cnh_err,
-        },
+            "proposta_json_path": proposta_json_path,
+            "cnh_json_path": cnh_json_path,
+        }
     }
 
     report = build_proposta_cnh_report(
         case_id=case_id,
-        proposta_data=proposta_data,
-        cnh_data=cnh_data,
+        proposta_data=proposta_data if isinstance(proposta_data, dict) else {},
+        cnh_data=cnh_data if isinstance(cnh_data, dict) else {},
         meta=meta,
     )
 
-    report_path: Optional[Path] = None
+    report_path = storage_root / "phase2" / case_id / "reports" / "proposta_vs_cnh.json"
     if write_report:
-        report_path = storage_root / "phase2" / case_id / "reports" / "proposta_vs_cnh.json"
         _write_json(report_path, report)
 
     return Phase2RunResult(
         case_id=case_id,
-        proposta_json_path=proposta_json_path,
-        cnh_json_path=cnh_json_path,
         report_path=report_path,
         report=report,
+        proposta_json_path=proposta_json_path,
+        cnh_json_path=cnh_json_path,
+        inputs=meta["inputs"],
     )
 
 
-if __name__ == "__main__":
-    # Execução manual (exemplo):
-    #   python -m orchestrator.phase2_runner 08b5395b-6eb3-4e37-90db-19c310b1107e
-    import sys
+# =============================================================================
+# Phase 2.A — CNH validity
+# =============================================================================
 
-    if len(sys.argv) < 2:
-        print("Usage: python -m orchestrator.phase2_runner <case_id>")
-        raise SystemExit(2)
+def run_phase2_cnh_validity(
+    *,
+    case_id: str,
+    storage_root: Path = Path("storage"),
+    write_report: bool = True,
+    today: Optional[date] = None,
+) -> Phase2RunResult:
+    cnh_doc = _load_latest_phase1_doc(
+        storage_root=storage_root,
+        case_id=case_id,
+        document_type="cnh",
+    )
 
-    cid = sys.argv[1].strip()
-    result = run_phase2_proposta_cnh(case_id=cid, storage_root=Path("./storage"), write_report=True)
+    cnh_json_path: Optional[str] = None
+    cnh_data: Dict[str, Any] = {}
 
-    print("case_id:", result.case_id)
-    print("proposta_json_path:", result.proposta_json_path)
-    print("cnh_json_path:", result.cnh_json_path)
-    print("report_path:", result.report_path)
-    print("summary:", result.report.get("summary"))
+    if cnh_doc is not None:
+        cnh_json_path = str(
+            (storage_root / "phase1" / case_id / "cnh").resolve()
+        )
+        data = cnh_doc.get("data") or {}
+        cnh_data = data if isinstance(data, dict) else {}
+
+    meta = {
+        "inputs": {
+            "cnh_json_path": cnh_json_path,
+        }
+    }
+
+    report = build_cnh_validity_report(
+        case_id=case_id,
+        cnh_data=cnh_data,
+        meta=meta,
+        today=today,
+    )
+
+    report_path = storage_root / "phase2" / case_id / "reports" / "cnh_validity.json"
+    if write_report:
+        _write_json(report_path, report)
+
+    return Phase2RunResult(
+        case_id=case_id,
+        report_path=report_path,
+        report=report,
+        proposta_json_path=None,
+        cnh_json_path=cnh_json_path,
+        inputs=meta["inputs"],
+    )
