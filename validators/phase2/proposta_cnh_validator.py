@@ -27,7 +27,6 @@ def normalize_name(value: Optional[str]) -> Optional[str]:
     v = _strip_accents(v)
     v = re.sub(r"\s+", " ", v)
     v = v.upper()
-    # remove caracteres não alfanuméricos (mantém espaço)
     v = re.sub(r"[^A-Z0-9 ]+", "", v)
     v = re.sub(r"\s+", " ", v).strip()
     return v or None
@@ -39,39 +38,28 @@ def normalize_cpf(value: Optional[str]) -> Optional[str]:
     digits = re.sub(r"\D+", "", value)
     if not digits:
         return None
-    # Se vier com 10/12/.., não inventa: reporta como está (mas normalizado em dígitos)
     return digits
 
 
 def normalize_date_to_iso(value: Optional[str]) -> Optional[str]:
-    """
-    Aceita formatos comuns da Fase 1:
-    - DD/MM/YYYY
-    - YYYY-MM-DD
-    - strings com espaços
-    Retorna ISO YYYY-MM-DD ou None se inválida.
-    """
     if value is None:
         return None
     v = str(value).strip()
     if not v:
         return None
 
-    # Tenta YYYY-MM-DD
     for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
         try:
             return datetime.strptime(v, fmt).date().isoformat()
         except ValueError:
             pass
 
-    # Tenta DD/MM/YYYY e variações
     for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
         try:
             return datetime.strptime(v, fmt).date().isoformat()
         except ValueError:
             pass
 
-    # Se vier com hora junto (ex: 2024-08-01 00:00:00)
     m = re.match(r"^(\d{4}-\d{2}-\d{2})[ T].+$", v)
     if m:
         return m.group(1)
@@ -80,19 +68,11 @@ def normalize_date_to_iso(value: Optional[str]) -> Optional[str]:
 
 
 # =============================================================================
-# Mapeamento de campos (onde buscar em cada documento)
+# Specs
 # =============================================================================
 
 @dataclass(frozen=True)
 class FieldSpec:
-    """
-    Define como encontrar um campo em cada documento e como normalizá-lo.
-    - key: nome canônico do campo no relatório
-    - proposta_paths: caminhos (dot-notation) onde tentar ler na proposta
-    - cnh_paths: caminhos (dot-notation) onde tentar ler na CNH
-    - normalizer: função de normalização
-    - comparable_when_missing: se False, campo vira not_comparable quando falta um lado
-    """
     key: str
     proposta_paths: Tuple[str, ...]
     cnh_paths: Tuple[str, ...]
@@ -103,22 +83,22 @@ class FieldSpec:
 DEFAULT_FIELD_SPECS: Tuple[FieldSpec, ...] = (
     FieldSpec(
         key="cpf",
-        proposta_paths=("cpf", "cpf_financiado", "documentos.cpf"),
-        cnh_paths=("cpf", "documento.cpf", "dados.cpf"),
+        proposta_paths=("cpf", "data.cpf"),
+        cnh_paths=("cpf", "data.cpf"),
         normalizer=normalize_cpf,
         comparable_when_missing=True,
     ),
     FieldSpec(
         key="nome",
-        proposta_paths=("nome_financiado", "nome", "cliente.nome"),
-        cnh_paths=("nome", "nome_completo", "documento.nome"),
+        proposta_paths=("nome_financiado", "data.nome_financiado", "data.nome"),
+        cnh_paths=("nome", "data.nome", "data.nome_completo"),
         normalizer=normalize_name,
         comparable_when_missing=True,
     ),
     FieldSpec(
         key="data_nascimento",
-        proposta_paths=("data_nascimento", "nascimento", "cliente.data_nascimento"),
-        cnh_paths=("data_nascimento", "nascimento", "documento.data_nascimento"),
+        proposta_paths=("data_nascimento", "data.data_nascimento", "data.nascimento"),
+        cnh_paths=("data_nascimento", "data.data_nascimento", "data.nascimento"),
         normalizer=normalize_date_to_iso,
         comparable_when_missing=True,
     ),
@@ -126,10 +106,18 @@ DEFAULT_FIELD_SPECS: Tuple[FieldSpec, ...] = (
 
 
 # =============================================================================
-# Utilitários de leitura por path
+# Lookup helpers (suporta data=dict e data=list)
 # =============================================================================
 
-def _get_by_dot_path(obj: Dict[str, Any], path: str) -> Any:
+def _is_empty_value(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    return False
+
+
+def _get_by_dot_path(obj: Any, path: str) -> Any:
     cur: Any = obj
     for part in path.split("."):
         if not isinstance(cur, dict):
@@ -140,22 +128,110 @@ def _get_by_dot_path(obj: Dict[str, Any], path: str) -> Any:
     return cur
 
 
-def _first_present(obj: Dict[str, Any], paths: Tuple[str, ...]) -> Tuple[Optional[str], Optional[Any]]:
+def _candidate_roots(doc: Dict[str, Any]) -> List[Tuple[str, Any]]:
     """
-    Retorna (path_usado, valor) do primeiro path que existir com valor não-vazio.
+    roots candidatos para busca:
+      - ("", doc)  (wrapper inteiro)
+      - ("data", doc["data"]) se data for dict
+      - ("data[i]", item) para cada item dict em data se data for list
     """
+    roots: List[Tuple[str, Any]] = [("", doc)]
+    data = doc.get("data")
+    if isinstance(data, dict):
+        roots.append(("data", data))
+    elif isinstance(data, list):
+        for i, item in enumerate(data):
+            if isinstance(item, dict):
+                roots.append((f"data[{i}]", item))
+    return roots
+
+
+def _first_present_in_roots(
+    *,
+    doc: Dict[str, Any],
+    paths: Tuple[str, ...],
+) -> Tuple[Optional[str], Optional[Any], str]:
+    """
+    Retorna (path_reportado, valor, strategy):
+      - strategy "path": encontrou no wrapper pelo path literal
+      - strategy "root_path": encontrou em data dict root usando path relativo
+      - strategy "list_item_path": encontrou em data[i] item dict usando path relativo
+      - strategy "none": não achou
+    Observação: aqui consideramos "presente" qualquer valor não-vazio; None/vazio não conta.
+    """
+    # 1) literal no wrapper (permite "data.xxx")
     for p in paths:
-        raw = _get_by_dot_path(obj, p)
-        if raw is None:
+        raw = _get_by_dot_path(doc, p)
+        if not _is_empty_value(raw):
+            return p, raw, "path"
+
+    # 2) roots alternativos com path relativo (sem "data.")
+    for prefix, root in _candidate_roots(doc):
+        if prefix == "":
             continue
-        if isinstance(raw, str) and not raw.strip():
+        for p in paths:
+            if p.startswith("data."):
+                continue
+            raw = _get_by_dot_path(root, p)
+            if _is_empty_value(raw):
+                continue
+            strategy = "root_path" if prefix == "data" else "list_item_path"
+            return f"{prefix}.{p}", raw, strategy
+
+    return None, None, "none"
+
+
+def _first_existing_path_even_if_null(
+    *,
+    doc: Dict[str, Any],
+    paths: Tuple[str, ...],
+) -> Tuple[Optional[str], Optional[Any], str]:
+    """
+    Igual ao _first_present_in_roots, mas aqui retorna o primeiro path que EXISTE
+    mesmo se o valor for None/vazio. Isso serve para diagnosticar 'missing_null'.
+    strategy:
+      - "path_exists"
+      - "root_path_exists"
+      - "list_item_path_exists"
+      - "none"
+    """
+    # 1) literal no wrapper
+    for p in paths:
+        # checa existência caminhando até o último dict
+        cur: Any = doc
+        ok = True
+        parts = p.split(".")
+        for part in parts:
+            if not isinstance(cur, dict) or part not in cur:
+                ok = False
+                break
+            cur = cur[part]
+        if ok:
+            return p, cur, "path_exists"
+
+    # 2) roots alternativos
+    for prefix, root in _candidate_roots(doc):
+        if prefix == "":
             continue
-        return p, raw
-    return None, None
+        for p in paths:
+            if p.startswith("data."):
+                continue
+            cur = root
+            ok = True
+            for part in p.split("."):
+                if not isinstance(cur, dict) or part not in cur:
+                    ok = False
+                    break
+                cur = cur[part]
+            if ok:
+                strategy = "root_path_exists" if prefix == "data" else "list_item_path_exists"
+                return f"{prefix}.{p}", cur, strategy
+
+    return None, None, "none"
 
 
 # =============================================================================
-# Relatório
+# Report
 # =============================================================================
 
 def _safe_str(v: Any) -> Optional[str]:
@@ -165,7 +241,6 @@ def _safe_str(v: Any) -> Optional[str]:
         return str(v)
     if isinstance(v, str):
         return v
-    # Para qualquer outro tipo, serializa simples
     try:
         return json.dumps(v, ensure_ascii=False)
     except Exception:
@@ -176,6 +251,21 @@ def _is_effectively_missing(v: Optional[str]) -> bool:
     return v is None or (isinstance(v, str) and v.strip() == "")
 
 
+def _evidence(doc: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Evidências mínimas para rastreabilidade (não decisório).
+    """
+    out: Dict[str, Any] = {}
+    for k in ("document_type", "document_id", "file_path", "file_hash", "created_at", "case_id"):
+        if k in doc:
+            out[k] = doc.get(k)
+    # Se existir debug canônico dentro de data
+    data = doc.get("data")
+    if isinstance(data, dict) and "debug" in data:
+        out["data_debug_keys"] = sorted(list(data.get("debug", {}).keys())) if isinstance(data.get("debug"), dict) else None
+    return out
+
+
 def build_proposta_cnh_report(
     *,
     case_id: str,
@@ -184,11 +274,6 @@ def build_proposta_cnh_report(
     field_specs: Tuple[FieldSpec, ...] = DEFAULT_FIELD_SPECS,
     meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Gera um relatório sem decisões automáticas.
-    - Não lança para divergência.
-    - Lista campos comparáveis, iguais e divergentes.
-    """
     comparable: List[Dict[str, Any]] = []
     iguais: List[Dict[str, Any]] = []
     divergentes: List[Dict[str, Any]] = []
@@ -196,8 +281,9 @@ def build_proposta_cnh_report(
     not_comparable: List[Dict[str, Any]] = []
 
     for spec in field_specs:
-        p_path, p_raw = _first_present(proposta_data, spec.proposta_paths)
-        c_path, c_raw = _first_present(cnh_data, spec.cnh_paths)
+        # 1) Busca por valor presente (não-vazio)
+        p_path, p_raw, p_strategy = _first_present_in_roots(doc=proposta_data, paths=spec.proposta_paths)
+        c_path, c_raw, c_strategy = _first_present_in_roots(doc=cnh_data, paths=spec.cnh_paths)
 
         p_raw_s = _safe_str(p_raw)
         c_raw_s = _safe_str(c_raw)
@@ -209,19 +295,21 @@ def build_proposta_cnh_report(
             "field": spec.key,
             "proposta": {
                 "path": p_path,
+                "strategy": p_strategy,
                 "raw": p_raw_s,
                 "normalized": p_norm,
             },
             "cnh": {
                 "path": c_path,
+                "strategy": c_strategy,
                 "raw": c_raw_s,
                 "normalized": c_norm,
             },
-            "status": None,          # preenchido abaixo
-            "explain": None,         # preenchido abaixo
+            "status": None,
+            "status_detail": None,  # "missing_absent" | "missing_null" | None
+            "explain": None,
         }
 
-        # Regras de comparabilidade
         p_missing = _is_effectively_missing(p_norm)
         c_missing = _is_effectively_missing(c_norm)
 
@@ -231,23 +319,46 @@ def build_proposta_cnh_report(
             not_comparable.append(entry)
             continue
 
-        # Se falta em ambos -> missing (não é divergência)
-        if p_missing and c_missing:
-            entry["status"] = "missing"
-            entry["explain"] = "Campo ausente nos dois documentos (após normalização)."
-            missing.append(entry)
-            continue
+        # Diagnóstico de missing: distinguir ausente vs nulo
+        if p_missing or c_missing:
+            # Para cada lado que está missing, checar se o path existe mesmo que o valor seja None
+            if p_missing:
+                p_exist_path, p_exist_val, p_exist_strategy = _first_existing_path_even_if_null(
+                    doc=proposta_data,
+                    paths=spec.proposta_paths,
+                )
+                if p_exist_path is not None:
+                    entry["proposta"]["path"] = p_exist_path
+                    entry["proposta"]["strategy"] = p_exist_strategy
+                    entry["proposta"]["raw"] = _safe_str(p_exist_val)
+                    entry["proposta"]["normalized"] = spec.normalizer(_safe_str(p_exist_val)) if _safe_str(p_exist_val) is not None else None
+                    entry["status_detail"] = "missing_null"
+                else:
+                    # mantém strategy atual (none)
+                    entry["status_detail"] = "missing_absent"
 
-        # Se falta em um lado -> missing (comparável, mas incompleto)
-        if p_missing and not c_missing:
-            entry["status"] = "missing"
-            entry["explain"] = "Campo ausente na Proposta (após normalização) e presente na CNH."
-            missing.append(entry)
-            continue
+            if c_missing:
+                c_exist_path, c_exist_val, c_exist_strategy = _first_existing_path_even_if_null(
+                    doc=cnh_data,
+                    paths=spec.cnh_paths,
+                )
+                if c_exist_path is not None:
+                    entry["cnh"]["path"] = c_exist_path
+                    entry["cnh"]["strategy"] = c_exist_strategy
+                    entry["cnh"]["raw"] = _safe_str(c_exist_val)
+                    entry["cnh"]["normalized"] = spec.normalizer(_safe_str(c_exist_val)) if _safe_str(c_exist_val) is not None else None
+                    # se já tinha missing_null do outro lado, mantém; senão define
+                    entry["status_detail"] = entry["status_detail"] or "missing_null"
+                else:
+                    entry["status_detail"] = entry["status_detail"] or "missing_absent"
 
-        if c_missing and not p_missing:
             entry["status"] = "missing"
-            entry["explain"] = "Campo ausente na CNH (após normalização) e presente na Proposta."
+            if p_missing and c_missing:
+                entry["explain"] = "Campo não preenchido nos dois documentos (ausente ou nulo após normalização)."
+            elif p_missing:
+                entry["explain"] = "Campo não preenchido na Proposta (ausente ou nulo após normalização) e presente na CNH."
+            else:
+                entry["explain"] = "Campo não preenchido na CNH (ausente ou nulo após normalização) e presente na Proposta."
             missing.append(entry)
             continue
 
@@ -266,8 +377,12 @@ def build_proposta_cnh_report(
     report = {
         "case_id": case_id,
         "validator": "proposta_vs_cnh",
-        "version": "0.1.0",
+        "version": "0.4.0",
         "meta": meta or {},
+        "evidence": {
+            "proposta": _evidence(proposta_data),
+            "cnh": _evidence(cnh_data),
+        },
         "summary": {
             "total_fields": len(field_specs),
             "comparable": len(comparable),
@@ -288,7 +403,7 @@ def build_proposta_cnh_report(
 
 
 # =============================================================================
-# Carregamento opcional de persistência Fase 1 (sem reprocessar)
+# Optional IO helpers
 # =============================================================================
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -310,10 +425,6 @@ def run_from_phase1_persisted(
     out_report_path: Optional[Path] = None,
     field_specs: Tuple[FieldSpec, ...] = DEFAULT_FIELD_SPECS,
 ) -> Dict[str, Any]:
-    """
-    Executa o validador usando SOMENTE os JSONs persistidos da Fase 1.
-    Se out_report_path for fornecido, persiste o relatório.
-    """
     proposta_data = load_json(proposta_json_path)
     cnh_data = load_json(cnh_json_path)
 
