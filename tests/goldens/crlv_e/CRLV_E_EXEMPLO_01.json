@@ -1,19 +1,11 @@
 {
-  "ano_fabricacao": "2009",
-  "ano_modelo": "2009",
-  "categoria": "PARTICULAR",
+  "ano_fabricacao": null,
+  "ano_modelo": null,
+  "categoria": "CAPACIDADE",
   "chassi": "9BFZF55P898396756",
-  "combustivel": "ALCOOL/GASOLINA",
-  "cor": "PRATA",
+  "combustivel": "ÍVEL REPASSE OBRIGATÓRIO AO VALOR DO IOF (R$) VALOR TOTAL A SER PAGO",
+  "cor": "PREDOMINANTE COMBUSTÍVEL REPASSE OBRIGATÓRIO AO VALOR DO IOF (R$) VALOR TOTAL A SER PAGO",
   "data_emissao": "08/06/2023",
-  "local_emissao": "SAO JOSE SC",
-  "marca_modelo": "FORD/FIESTA 1.6 FLEX",
-  "mode": "native",
-  "placa": "MHA7923",
-  "proprietario_doc": "070.813.439-45",
-  "proprietario_nome": "WILLIAN BAUMANN",
-  "renavam": "00133070786",
-  "uf_licenciamento": "SC",
   "debug": {
     "checks": {
       "renavam": {
@@ -23,18 +15,26 @@
         "reason": "ok"
       }
     },
-    "warnings": [],
-    "mode": "native",
-    "native_text_len": 0,
-    "ocr_text_len": 0,
     "min_text_len_threshold": 800,
+    "mode": "native",
+    "native_text_len": 2066,
     "ocr_dpi": 300,
+    "ocr_text_len": 0,
     "pages": [
       {
-        "page": 1,
-        "native_len": 0,
-        "ocr_len": 0
+        "native_len": 2066,
+        "ocr_len": 0,
+        "page": 1
       }
-    ]
-  }
+    ],
+    "warnings": []
+  },
+  "local_emissao": "DATA",
+  "marca_modelo": null,
+  "mode": "native",
+  "placa": "MHA7923",
+  "proprietario_doc": null,
+  "proprietario_nome": null,
+  "renavam": "00133070786",
+  "uf_licenciamento": "CHASSI"
 }
