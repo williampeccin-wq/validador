@@ -1,295 +1,265 @@
 # orchestrator/phase1.py
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import mimetypes
 import os
+import traceback
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Any, Dict, Literal, Optional, Set, Tuple
-
-# Parsers reais do projeto
-from parsers.proposta_daycoval import analyze_proposta_daycoval
-from parsers.cnh import analyze_cnh
-
-# OCR / extração de texto (PDF/imagem)
-from core.ocr import extract_text_any
+from datetime import datetime, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional, Tuple
 
 
-DocumentType = Literal[
-    "proposta_daycoval",
-    "cnh",
-]
+# ======================================================================================
+# Storage / config
+# ======================================================================================
 
-# Pacote mínimo — Gate 1
-PACKAGES: Dict[str, Set[str]] = {
-    "gate1_proposta_cnh": {"proposta_daycoval", "cnh"},
-}
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _storage_root() -> Path:
+    """
+    Mantém compatibilidade com a estrutura atual.
+    Por padrão: storage/phase1
+    Permite override por env var para testes: PHASE1_STORAGE_ROOT
+    """
+    return Path(os.getenv("PHASE1_STORAGE_ROOT", "storage/phase1"))
+
+
+# ======================================================================================
+# Document types (Gate 1 exige apenas Proposta + CNH; demais são opcionais)
+# ======================================================================================
+
+class DocumentType(str, Enum):
+    # Gate 1
+    PROPOSTA_DAYCOVAL = "proposta_daycoval"
+    CNH = "cnh"
+
+    # Opcionais na Fase 1 (não alteram Gate 1)
+    HOLERITE = "holerite"
+    FOLHA_PAGAMENTO = "folha_pagamento"
+    EXTRATO_BANCARIO = "extrato_bancario"
+
+
+# ======================================================================================
+# Parser registry + adapters
+# ======================================================================================
+
+ParserFn = Callable[[str], Dict[str, Any]]
+
+
+def _lazy_import_parser(module_name: str, fn_name: str) -> Optional[ParserFn]:
+    """
+    Importa parsers sob demanda para evitar custo/efeitos colaterais e
+    para manter a Fase 1 resiliente (não bloquear fluxo).
+    """
+    try:
+        mod = __import__(module_name, fromlist=[fn_name])
+        fn = getattr(mod, fn_name)
+        if not callable(fn):
+            return None
+        return fn  # type: ignore[return-value]
+    except Exception:
+        return None
+
+
+def _parser_registry() -> Dict[DocumentType, Optional[ParserFn]]:
+    """
+    Mapeia tipos para suas funções de análise em parsers/.
+    Se um parser não existir, o collect_document ainda persiste bruto e segue.
+    """
+    return {
+        # Gate 1
+        DocumentType.PROPOSTA_DAYCOVAL: _lazy_import_parser(
+            "parsers.proposta_daycoval", "analyze_proposta_daycoval"
+        ),
+        DocumentType.CNH: _lazy_import_parser(
+            "parsers.cnh", "analyze_cnh"  # se seu repo usa outro nome, ajuste aqui
+        ),
+        # Opcionais
+        DocumentType.HOLERITE: _lazy_import_parser(
+            "parsers.holerite", "analyze_holerite"
+        ),
+        DocumentType.FOLHA_PAGAMENTO: _lazy_import_parser(
+            "parsers.folha_pagamento", "analyze_folha_pagamento"
+        ),
+        DocumentType.EXTRATO_BANCARIO: _lazy_import_parser(
+            "parsers.extrato_bancario", "analyze_extrato_bancario"
+        ),
+    }
 
 
 @dataclass(frozen=True)
-class CaseStatus:
-    case_id: str
-    package: str
-    present: Set[str]
-    missing: Set[str]
-    is_complete: bool
+class RawPayload:
+    filename: str
+    mime_type: str
+    size_bytes: int
+    sha256: str
+    content_b64: str
 
 
-# =========================
-# CONFIG EXTRAÇÃO DE TEXTO
-# =========================
+def _read_file_as_raw_payload(file_path: str) -> RawPayload:
+    p = Path(file_path)
+    data = p.read_bytes()
 
-def _text_extract_config(context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Config consolidada (context > env > default).
-    """
-    return {
-        "tesseract_cmd": context.get("tesseract_cmd") or os.getenv("TESSERACT_CMD") or "tesseract",
-        "poppler_path": context.get("poppler_path") or os.getenv("POPPLER_PATH") or "",
-        "min_text_len_threshold": int(context.get("min_text_len_threshold") or os.getenv("MIN_TEXT_LEN_THRESHOLD") or 800),
-        "ocr_dpi": int(context.get("ocr_dpi") or os.getenv("OCR_DPI") or 350),
-    }
+    sha = hashlib.sha256(data).hexdigest()
+    mime, _enc = mimetypes.guess_type(str(p))
+    if not mime:
+        # fallback simples
+        mime = "application/octet-stream"
 
-
-def _read_file_bytes(file_path: str) -> bytes:
-    with open(file_path, "rb") as f:
-        return f.read()
-
-
-def _extract_text_best_effort(file_path: str, context: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-    """
-    Extrai texto de PDF/imagem com fallback para OCR quando texto nativo é insuficiente.
-    Não bloqueia: em caso de erro, retorna texto vazio e debug com erro.
-    """
-    cfg = _text_extract_config(context)
-    dbg: Dict[str, Any] = {
-        "file_path": file_path,
-        "filename": os.path.basename(file_path),
-        "config": {
-            "min_text_len_threshold": cfg["min_text_len_threshold"],
-            "ocr_dpi": cfg["ocr_dpi"],
-            "poppler_path": cfg["poppler_path"],
-            "tesseract_cmd": cfg["tesseract_cmd"],
-        },
-        "error": None,
-        "text_len_final": 0,
-    }
-
-    try:
-        file_bytes = _read_file_bytes(file_path)
-        text, dbg_ocr = extract_text_any(
-            file_bytes=file_bytes,
-            filename=os.path.basename(file_path),
-            tesseract_cmd=cfg["tesseract_cmd"],
-            poppler_path=cfg["poppler_path"],
-            min_text_len_threshold=cfg["min_text_len_threshold"],
-            ocr_dpi=cfg["ocr_dpi"],
-        )
-        dbg["extract"] = dbg_ocr
-        dbg["text_len_final"] = len(text or "")
-        return (text or ""), dbg
-    except Exception as e:
-        dbg["error"] = f"{type(e).__name__}: {e}"
-        return "", dbg
-
-
-# =========================
-# ADAPTERS DE PARSER (Fase 1)
-# =========================
-
-def _parse_proposta_daycoval(file_path: str, context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Adapter Fase 1:
-    - Extrai texto (native -> OCR se necessário)
-    - Passa raw_text para o parser (API real: analyze_proposta_daycoval(raw_text=...))
-    - Não bloqueia
-    """
-    raw_text, dbg_text = _extract_text_best_effort(file_path, context)
-
-    try:
-        fields = analyze_proposta_daycoval(
-            raw_text=raw_text,
-            filename=os.path.basename(file_path),
-            return_debug=False,
-        )
-    except Exception as e:
-        fields = {"debug": {"parser_error": f"{type(e).__name__}: {e}"}}
-
-    if isinstance(fields, dict):
-        fields.setdefault("debug", {})
-        if isinstance(fields["debug"], dict):
-            fields["debug"]["text_extract"] = dbg_text
-        else:
-            fields["debug"] = {"text_extract": dbg_text}
-        return fields
-
-    return {"debug": {"text_extract": dbg_text}}
-
-
-def _parse_cnh(file_path: str, context: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Adapter Fase 1:
-    - Extrai texto (native -> OCR se necessário)
-    - CNH: analyze_cnh retorna (fields, dbg) SEMPRE
-    - Persistimos fields em data e colocamos debug agregado em data.debug
-    - Não bloqueia
-    """
-    raw_text, dbg_text = _extract_text_best_effort(file_path, context)
-
-    try:
-        fields, dbg_parser = analyze_cnh(raw_text=raw_text, filename=os.path.basename(file_path), use_gemini=True)
-    except Exception as e:
-        fields, dbg_parser = ({}, {"parser_error": f"{type(e).__name__}: {e}"})
-
-    if not isinstance(fields, dict):
-        # fallback defensivo
-        fields = {}
-
-    fields.setdefault("debug", {})
-    if not isinstance(fields["debug"], dict):
-        fields["debug"] = {}
-
-    fields["debug"]["text_extract"] = dbg_text
-    fields["debug"]["parser_debug"] = dbg_parser if isinstance(dbg_parser, dict) else {"raw": str(dbg_parser)}
-
-    return fields
-
-
-PARSERS = {
-    "proposta_daycoval": _parse_proposta_daycoval,
-    "cnh": _parse_cnh,
-}
-
-
-# =========================
-# ORQUESTRADOR — FASE 1
-# =========================
-
-def start_case(*, storage_root: str = "storage/phase1") -> str:
-    case_id = str(uuid.uuid4())
-    os.makedirs(os.path.join(storage_root, case_id), exist_ok=True)
-
-    meta = {
-        "case_id": case_id,
-        "phase": 1,
-        "created_at": datetime.now(UTC).isoformat(),
-    }
-    _write_json(os.path.join(storage_root, case_id, "_case.json"), meta)
-    return case_id
-
-
-def collect_document(
-    case_id: str,
-    file_path: str,
-    *,
-    document_type: DocumentType,
-    context: Optional[Dict[str, Any]] = None,
-    storage_root: str = "storage/phase1",
-) -> Dict[str, Any]:
-    """
-    Não-bloqueante:
-    - Se file_path não existir ou der erro de leitura, ainda persiste payload com debug de erro.
-    """
-    if document_type not in PARSERS:
-        raise ValueError(f"Tipo de documento não suportado: {document_type}")
-
-    context = context or {}
-    document_id = str(uuid.uuid4())
-
-    file_hash: Optional[str] = None
-    collect_error: Optional[str] = None
-
-    # hash (best-effort)
-    try:
-        file_hash = _hash_file(file_path)
-    except Exception as e:
-        collect_error = f"{type(e).__name__}: {e}"
-        file_hash = None
-
-    # parse (best-effort)
-    parser = PARSERS[document_type]
-    try:
-        parsed = parser(file_path, context)
-    except Exception as e:
-        parsed = {"debug": {"parser_error": f"{type(e).__name__}: {e}"}}
-
-    # injeta erro de coleta no debug do data (se houver)
-    if collect_error:
-        if isinstance(parsed, dict):
-            parsed.setdefault("debug", {})
-            if isinstance(parsed["debug"], dict):
-                parsed["debug"]["collect_error"] = collect_error
-            else:
-                parsed["debug"] = {"collect_error": collect_error}
-        else:
-            parsed = {"debug": {"collect_error": collect_error, "raw": str(parsed)}}
-
-    payload = {
-        "case_id": case_id,
-        "document_id": document_id,
-        "document_type": document_type,
-        "file_path": file_path,
-        "file_hash": file_hash,
-        "data": parsed,
-        "created_at": datetime.now(UTC).isoformat(),
-    }
-
-    out_dir = os.path.join(storage_root, case_id, document_type)
-    os.makedirs(out_dir, exist_ok=True)
-
-    out_path = os.path.join(out_dir, f"{document_id}.json")
-    _write_json(out_path, payload)
-
-    return payload
-
-
-def case_status(
-    case_id: str,
-    *,
-    package: str = "gate1_proposta_cnh",
-    storage_root: str = "storage/phase1",
-) -> CaseStatus:
-    required = PACKAGES[package]
-    present = _present_document_types(case_id, storage_root)
-
-    missing = set(required) - present
-    return CaseStatus(
-        case_id=case_id,
-        package=package,
-        present=present,
-        missing=missing,
-        is_complete=len(missing) == 0,
+    return RawPayload(
+        filename=p.name,
+        mime_type=mime,
+        size_bytes=len(data),
+        sha256=sha,
+        content_b64=base64.b64encode(data).decode("ascii"),
     )
 
 
-# =========================
-# AUXILIARES
-# =========================
+def _build_doc_record(
+    *,
+    case_id: str,
+    doc_id: str,
+    document_type: DocumentType,
+    raw: RawPayload,
+    parsed_data: Optional[Dict[str, Any]],
+    parse_error: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "schema_version": "phase1.v1",
+        "phase": 1,
+        "case_id": case_id,
+        "doc_id": doc_id,
+        "document_type": document_type.value,
+        "created_at": _utc_now_iso(),
+        "raw": {
+            "filename": raw.filename,
+            "mime_type": raw.mime_type,
+            "size_bytes": raw.size_bytes,
+            "sha256": raw.sha256,
+            "content_b64": raw.content_b64,
+        },
+        # Mantém a mesma ideia: persistir bruto + o que der para extrair.
+        # Se falhar, não bloqueia: data fica None e o erro fica em debug.
+        "data": parsed_data,
+        "debug": {
+            "parse_error": parse_error,
+        },
+    }
 
-def _present_document_types(case_id: str, storage_root: str) -> Set[str]:
-    base = os.path.join(storage_root, case_id)
-    if not os.path.isdir(base):
-        return set()
 
-    found: Set[str] = set()
-    for name in os.listdir(base):
-        p = os.path.join(base, name)
-        if os.path.isdir(p) and any(f.endswith(".json") for f in os.listdir(p)):
-            found.add(name)
-    return found
+def _write_doc_json(case_id: str, document_type: DocumentType, doc_id: str, doc: Dict[str, Any]) -> Path:
+    root = _storage_root()
+    out_dir = root / case_id / document_type.value
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{doc_id}.json"
+    out_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path
 
 
-def _hash_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
+# ======================================================================================
+# Public API (Fase 1)
+# ======================================================================================
+
+def start_case() -> str:
+    """
+    Cria um novo case_id.
+    Mantém comportamento simples e determinístico: uuid4.
+    """
+    return str(uuid.uuid4())
 
 
-def _write_json(path: str, payload: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+def collect_document(case_id: str, file_path: str, document_type: str | DocumentType) -> Dict[str, Any]:
+    """
+    Coleta e persiste um documento na Fase 1.
+
+    Regras atendidas:
+    - Não bloquear fluxo: sempre persiste payload bruto; parser pode falhar sem exception.
+    - Não conclui aprovado/reprovado.
+    - Mantém compatibilidade do storage: storage/phase1/<case_id>/<document_type>/<doc_id>.json
+    """
+    dt = DocumentType(document_type) if not isinstance(document_type, DocumentType) else document_type
+    doc_id = str(uuid.uuid4())
+
+    raw = _read_file_as_raw_payload(file_path)
+
+    parsers = _parser_registry()
+    parser = parsers.get(dt)
+
+    parsed: Optional[Dict[str, Any]] = None
+    parse_error: Optional[Dict[str, Any]] = None
+
+    if parser is not None:
+        try:
+            parsed = parser(file_path)
+        except Exception as e:
+            parse_error = {
+                "message": str(e),
+                "type": e.__class__.__name__,
+                "traceback": traceback.format_exc(),
+            }
+            parsed = None
+    else:
+        # Parser ausente: não é erro "fatal". Persistimos e seguimos.
+        parse_error = {
+            "message": "Parser not available for this document_type",
+            "type": "ParserNotAvailable",
+            "traceback": None,
+        }
+
+    doc = _build_doc_record(
+        case_id=case_id,
+        doc_id=doc_id,
+        document_type=dt,
+        raw=raw,
+        parsed_data=parsed,
+        parse_error=parse_error,
+    )
+
+    _write_doc_json(case_id, dt, doc_id, doc)
+    return doc
+
+
+def gate1_is_ready(case_id: str) -> bool:
+    """
+    Gate 1 permanece INTACTO:
+    exige apenas Proposta (Daycoval) + CNH coletados (existência de ao menos 1 JSON em cada pasta).
+    """
+    root = _storage_root() / case_id
+
+    proposta_dir = root / DocumentType.PROPOSTA_DAYCOVAL.value
+    cnh_dir = root / DocumentType.CNH.value
+
+    def _has_any_json(d: Path) -> bool:
+        return d.exists() and any(p.suffix.lower() == ".json" for p in d.iterdir() if p.is_file())
+
+    return _has_any_json(proposta_dir) and _has_any_json(cnh_dir)
+
+
+def list_collected_documents(case_id: str) -> Dict[str, Any]:
+    """
+    Utilitário: lista o que já foi coletado (por tipo) sem inferir/aprovar nada.
+    """
+    root = _storage_root() / case_id
+    out: Dict[str, Any] = {"case_id": case_id, "types": {}}
+
+    if not root.exists():
+        return out
+
+    for dt in DocumentType:
+        d = root / dt.value
+        if not d.exists():
+            continue
+        docs = sorted([p.name for p in d.glob("*.json") if p.is_file()])
+        if docs:
+            out["types"][dt.value] = docs
+
+    out["gate1_ready"] = gate1_is_ready(case_id)
+    return out
