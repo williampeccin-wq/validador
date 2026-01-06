@@ -1,192 +1,215 @@
-# validators/phase2/proposta_cnh_validator.py
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, List
-import re
-
-JsonDict = Dict[str, Any]
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 
-# =========================
-# Normalização
-# =========================
+# ======================================================================================
+# Helpers
+# ======================================================================================
 
-def _norm_str(v: Optional[str]) -> Optional[str]:
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _norm_str(v: Any) -> Optional[str]:
     if v is None:
         return None
-    v = str(v).strip()
+    s = str(v).strip()
+    return s or None
+
+
+def _norm_spaces_upper(v: Optional[str]) -> Optional[str]:
     if not v:
         return None
     return " ".join(v.upper().split())
 
 
-def _norm_cpf(v: Optional[str]) -> Optional[str]:
+def _digits_only(v: Optional[str]) -> Optional[str]:
     if not v:
         return None
-    digits = "".join(c for c in v if c.isdigit())
-    return digits if len(digits) == 11 else None
+    return "".join(c for c in v if c.isdigit()) or None
 
 
 def _norm_date(v: Optional[str]) -> Optional[str]:
+    """
+    Normaliza datas comuns:
+    - DD/MM/YYYY
+    - YYYY-MM-DD
+    Retorna YYYY-MM-DD ou None
+    """
     if not v:
         return None
 
-    s = str(v).strip()
-
-    # DD/MM/YYYY → YYYY-MM-DD
-    m = re.match(r"^(\d{2})/(\d{2})/(\d{4})$", s)
-    if m:
-        dd, mm, yyyy = m.groups()
-        return f"{yyyy}-{mm}-{dd}"
-
-    # YYYY-MM-DD
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s)
-    if m:
-        return s
-
+    v = v.strip()
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(v, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
     return None
 
 
-# =========================
-# Helpers
-# =========================
-
-def _get(d: Dict[str, Any], key: str) -> Any:
-    return d.get(key) if isinstance(d, dict) else None
-
-
-def _derive_nome_mae_from_cnh(cnh: Dict[str, Any]) -> Optional[str]:
-    filiacao = cnh.get("filiacao")
-    if isinstance(filiacao, list) and len(filiacao) >= 2:
-        return filiacao[1]
-    return None
+def _safe_data(doc: Optional[dict]) -> dict:
+    if not isinstance(doc, dict):
+        return {}
+    if "data" in doc and isinstance(doc["data"], dict):
+        return doc["data"]
+    return doc
 
 
-# =========================
-# Builder Phase 2
-# =========================
+def _explain_pair(raw: Optional[str], normalized: Optional[str]) -> Dict[str, Optional[str]]:
+    return {"raw": raw, "normalized": normalized}
+
+
+def _mk_explain(field: str, status: str, p: dict, c: dict) -> str:
+    """
+    String curta e determinística para auditoria/UX.
+    """
+    pr = p.get("raw")
+    cr = c.get("raw")
+    pn = p.get("normalized")
+    cn = c.get("normalized")
+    return (
+        f"{field}: status={status}; "
+        f"proposta(raw={pr}, norm={pn}); "
+        f"cnh(raw={cr}, norm={cn})"
+    )
+
+
+# ======================================================================================
+# Core builder
+# ======================================================================================
 
 def build_proposta_cnh_report(
     *,
     case_id: str,
-    proposta_data: Optional[Dict[str, Any]] = None,
-    cnh_data: Optional[Dict[str, Any]] = None,
-    proposta_doc: Optional[Dict[str, Any]] = None,
-    cnh_doc: Optional[Dict[str, Any]] = None,
-    meta: Optional[Dict[str, Any]] = None,
-) -> JsonDict:
-    proposta = proposta_data or proposta_doc or {}
-    cnh = cnh_data or cnh_doc or {}
-    meta = meta or {}
+    # aliases aceitos pelos testes
+    proposta_data: Optional[dict] = None,
+    cnh_data: Optional[dict] = None,
+    # compat com runner
+    proposta_payload: Optional[dict] = None,
+    cnh_payload: Optional[dict] = None,
+    proposta_read_error: Optional[str] = None,
+    cnh_read_error: Optional[str] = None,
+) -> Dict[str, Any]:
 
-    fields: List[Dict[str, Any]] = []
+    proposta_src = proposta_data if proposta_data is not None else proposta_payload
+    cnh_src = cnh_data if cnh_data is not None else cnh_payload
 
-    def compare(field: str, p_raw, c_raw, norm_fn, *, c_strategy="path", c_path=None):
-        p_norm = norm_fn(p_raw)
-        c_norm = norm_fn(c_raw)
+    proposta = _safe_data(proposta_src)
+    cnh = _safe_data(cnh_src)
 
-        if p_norm is None and c_norm is None:
+    # ===== raw values =====
+    cpf_prop_raw = _norm_str(proposta.get("cpf"))
+    cpf_cnh_raw = _norm_str(cnh.get("cpf"))
+
+    nome_prop_raw = _norm_str(proposta.get("nome_financiado") or proposta.get("nome"))
+    nome_cnh_raw = _norm_str(cnh.get("nome"))
+
+    dn_prop_raw = _norm_str(proposta.get("data_nascimento"))
+    dn_cnh_raw = _norm_str(cnh.get("data_nascimento"))
+
+    # ===== normalized values =====
+    cpf_prop_norm = _digits_only(cpf_prop_raw)
+    cpf_cnh_norm = _digits_only(cpf_cnh_raw)
+
+    nome_prop_norm = _norm_spaces_upper(nome_prop_raw)
+    nome_cnh_norm = _norm_spaces_upper(nome_cnh_raw)
+
+    dn_prop_norm = _norm_date(dn_prop_raw)
+    dn_cnh_norm = _norm_date(dn_cnh_raw)
+
+    fields = {
+        "cpf": {
+            "proposta": _explain_pair(cpf_prop_raw, cpf_prop_norm),
+            "cnh": _explain_pair(cpf_cnh_raw, cpf_cnh_norm),
+        },
+        "nome": {
+            "proposta": _explain_pair(nome_prop_raw, nome_prop_norm),
+            "cnh": _explain_pair(nome_cnh_raw, nome_cnh_norm),
+        },
+        "data_nascimento": {
+            "proposta": _explain_pair(dn_prop_raw, dn_prop_norm),
+            "cnh": _explain_pair(dn_cnh_raw, dn_cnh_norm),
+        },
+    }
+
+    sections = {"equal": [], "divergent": [], "missing": []}
+
+    for field, payload in fields.items():
+        p = payload["proposta"]
+        c = payload["cnh"]
+
+        p_raw = p.get("raw")
+        c_raw = c.get("raw")
+        p_norm = p.get("normalized")
+        c_norm = c.get("normalized")
+
+        if p_raw is None or c_raw is None:
             status = "missing"
-            detail = "missing_both"
-            explain = "Campo ausente ou ilegível em ambos os documentos."
-        elif p_norm is None:
-            status = "missing"
-            detail = "missing_proposta"
-            explain = "Campo presente na CNH e ausente ou ilegível na Proposta."
-        elif c_norm is None:
-            status = "missing"
-            detail = "missing_cnh"
-            explain = "Campo presente na Proposta e ausente ou ilegível na CNH."
-        elif p_norm == c_norm:
+            item = {
+                "field": field,
+                "status": status,
+                "proposta": p,
+                "cnh": c,
+            }
+            item["explain"] = _mk_explain(field, status, p, c)
+            sections["missing"].append(item)
+            continue
+
+        if p_norm is None or c_norm is None:
+            status = "not_comparable"
+            item = {
+                "field": field,
+                "status": status,
+                "proposta": p,
+                "cnh": c,
+            }
+            item["explain"] = _mk_explain(field, status, p, c)
+            sections["missing"].append(item)
+            continue
+
+        if p_norm == c_norm:
             status = "equal"
-            detail = None
-            explain = "Valores normalizados são idênticos entre Proposta e CNH."
+            item = {
+                "field": field,
+                "status": status,
+                "proposta": p,
+                "cnh": c,
+            }
+            item["explain"] = _mk_explain(field, status, p, c)
+            sections["equal"].append(item)
         else:
             status = "different"
-            detail = None
-            explain = "Valores normalizados divergem entre Proposta e CNH."
-
-        fields.append({
-            "field": field,
-            "status": status,
-            "status_detail": detail,
-            "explain": explain,
-            "proposta": {
-                "raw": p_raw,
-                "normalized": p_norm,
-                "strategy": "path",
-            },
-            "cnh": {
-                "raw": c_raw,
-                "normalized": c_norm,
-                "strategy": c_strategy,
-                "path": c_path,
-            },
-        })
-
-    # ===== Comparações =====
-
-    compare("cpf",
-        _get(proposta, "cpf"),
-        _get(cnh, "cpf"),
-        _norm_cpf,
-        c_path="cpf",
-    )
-
-    compare("nome",
-        _get(proposta, "nome_financiado"),
-        _get(cnh, "nome"),
-        _norm_str,
-        c_path="nome",
-    )
-
-    compare("data_nascimento",
-        _get(proposta, "data_nascimento"),
-        _get(cnh, "data_nascimento"),
-        _norm_date,
-        c_path="data_nascimento",
-    )
-
-    compare("cidade_nascimento",
-        _get(proposta, "cidade_nascimento"),
-        _get(cnh, "cidade_nascimento"),
-        _norm_str,
-        c_path="cidade_nascimento",
-    )
-
-    compare("uf_nascimento",
-        _get(proposta, "uf"),
-        _get(cnh, "uf_nascimento"),
-        _norm_str,
-        c_path="uf_nascimento",
-    )
-
-    compare("nome_mae",
-        _get(proposta, "nome_mae"),
-        _derive_nome_mae_from_cnh(cnh),
-        _norm_str,
-        c_strategy="derive",
-        c_path="filiacao[1]",
-    )
+            item = {
+                "field": field,
+                "status": status,
+                "proposta": p,
+                "cnh": c,
+            }
+            item["explain"] = _mk_explain(field, status, p, c)
+            sections["divergent"].append(item)
 
     summary = {
         "total_fields": len(fields),
-        "comparable": len(fields),
-        "equal": sum(f["status"] == "equal" for f in fields),
-        "different": sum(f["status"] == "different" for f in fields),
-        "missing": sum(f["status"] == "missing" for f in fields),
-        "not_comparable": 0,
+        "equal": len(sections["equal"]),
+        "divergent": len(sections["divergent"]),
+        "missing": len(sections["missing"]),
     }
 
-    return {
-        "validator": "proposta_vs_cnh",
+    report = {
         "case_id": case_id,
+        "created_at": _utc_now_iso(),
+        "validator": "proposta_vs_cnh",
         "summary": summary,
-        "sections": {
-            "all": fields,
-            "equal": [f for f in fields if f["status"] == "equal"],
-            "different": [f for f in fields if f["status"] == "different"],
-            "missing": [f for f in fields if f["status"] == "missing"],
+        "sections": sections,
+        "inputs": {
+            "proposta_found": bool(proposta_src),
+            "cnh_found": bool(cnh_src),
+            "proposta_read_error": proposta_read_error,
+            "cnh_read_error": cnh_read_error,
         },
-        "meta": meta,
     }
+
+    return report
