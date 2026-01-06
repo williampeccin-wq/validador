@@ -3,31 +3,53 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from validators.phase2.proposta_cnh_validator import build_proposta_cnh_report
-from validators.phase2.cnh_validity_validator import build_cnh_validity_report
+from validators.phase2.income_declared_vs_proven_validator import (
+    build_income_declared_vs_proven_report,
+)
+
+
+# =============================================================================
+# Types
+# =============================================================================
 
 JsonDict = Dict[str, Any]
 
 
 @dataclass(frozen=True)
 class Phase2RunResult:
+    """
+    Resultado estável do runner Proposta↔CNH (não altere o contrato sem atualizar testes).
+    """
     case_id: str
-    report_path: Path
+    proposta_json_path: Optional[Path]
+    cnh_json_path: Optional[Path]
+    report_path: Optional[Path]
     report: JsonDict
 
-    # 🔒 CONTRATO PÚBLICO (mantido)
-    proposta_json_path: Optional[str]
-    cnh_json_path: Optional[str]
 
-    # extra (novo, não quebra testes)
-    inputs: Dict[str, Optional[str]]
+@dataclass(frozen=True)
+class Phase2IncomeRunResult:
+    """
+    Resultado do runner de renda declarada vs comprovada.
+    """
+    case_id: str
+    proposta_json_path: Optional[Path]
+    holerite_json_path: Optional[Path]
+    folha_json_path: Optional[Path]
+    extrato_json_path: Optional[Path]
+    report_path: Optional[Path]
+    report: JsonDict
 
 
-def _read_json(path: Path) -> JsonDict:
+# =============================================================================
+# Helpers
+# =============================================================================
+
+def _load_json(path: Path) -> JsonDict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -36,142 +58,158 @@ def _write_json(path: Path, payload: JsonDict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _latest_json_in_dir(dir_path: Path) -> Optional[Path]:
+def _pick_latest_json_in_dir(dir_path: Path) -> Optional[Path]:
     if not dir_path.exists() or not dir_path.is_dir():
         return None
-    files = sorted(dir_path.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[0] if files else None
-
-
-def _load_latest_phase1_doc(
-    *,
-    storage_root: Path,
-    case_id: str,
-    document_type: str,
-) -> Optional[JsonDict]:
-    doc_dir = storage_root / "phase1" / case_id / document_type
-    latest = _latest_json_in_dir(doc_dir)
-    if latest is None:
+    files = sorted(dir_path.glob("*.json"))
+    if not files:
         return None
-    return _read_json(latest)
+    return max(files, key=lambda p: p.stat().st_mtime)
+
+
+def _safe_read_json(path: Optional[Path]) -> Tuple[JsonDict, Optional[str]]:
+    if path is None:
+        return {}, "missing_file"
+    try:
+        return _load_json(path), None
+    except Exception as e:
+        return {}, f"read_error: {type(e).__name__}: {e}"
+
+
+def _get_data_dict(doc_json: JsonDict) -> JsonDict:
+    data = doc_json.get("data", {})
+    return data if isinstance(data, dict) else {}
 
 
 # =============================================================================
-# Phase 2 — Proposta ↔ CNH
+# Public API
 # =============================================================================
 
 def run_phase2_proposta_cnh(
     *,
     case_id: str,
-    storage_root: Path = Path("storage"),
+    storage_root: Path = Path("./storage"),
     write_report: bool = True,
 ) -> Phase2RunResult:
-    proposta_doc = _load_latest_phase1_doc(
-        storage_root=storage_root,
-        case_id=case_id,
-        document_type="proposta_daycoval",
-    )
-    cnh_doc = _load_latest_phase1_doc(
-        storage_root=storage_root,
-        case_id=case_id,
-        document_type="cnh",
-    )
+    phase1_dir = storage_root / "phase1" / case_id
+    proposta_dir = phase1_dir / "proposta_daycoval"
+    cnh_dir = phase1_dir / "cnh"
 
-    proposta_json_path: Optional[str] = None
-    cnh_json_path: Optional[str] = None
+    proposta_json_path = _pick_latest_json_in_dir(proposta_dir)
+    cnh_json_path = _pick_latest_json_in_dir(cnh_dir)
 
-    proposta_data: Dict[str, Any] = {}
-    cnh_data: Dict[str, Any] = {}
+    proposta_doc, proposta_err = _safe_read_json(proposta_json_path)
+    cnh_doc, cnh_err = _safe_read_json(cnh_json_path)
 
-    if proposta_doc is not None:
-        proposta_json_path = str(
-            (storage_root / "phase1" / case_id / "proposta_daycoval").resolve()
-        )
-        proposta_data = proposta_doc.get("data") or {}
-
-    if cnh_doc is not None:
-        cnh_json_path = str(
-            (storage_root / "phase1" / case_id / "cnh").resolve()
-        )
-        cnh_data = cnh_doc.get("data") or {}
-
-    meta = {
-        "inputs": {
-            "proposta_json_path": proposta_json_path,
-            "cnh_json_path": cnh_json_path,
-        }
-    }
+    proposta_data = _get_data_dict(proposta_doc)
+    cnh_data = cnh_doc.get("data", {})  # CNH pode ser dict ou list dependendo do estágio
 
     report = build_proposta_cnh_report(
         case_id=case_id,
-        proposta_data=proposta_data if isinstance(proposta_data, dict) else {},
-        cnh_data=cnh_data if isinstance(cnh_data, dict) else {},
-        meta=meta,
+        proposta_payload=proposta_doc,
+        cnh_payload=cnh_doc,
+        proposta_read_error=proposta_err,
+        cnh_read_error=cnh_err,
     )
 
-    report_path = storage_root / "phase2" / case_id / "reports" / "proposta_vs_cnh.json"
+    report_path: Optional[Path] = None
     if write_report:
+        report_path = storage_root / "phase2" / case_id / "reports" / "proposta_vs_cnh.json"
         _write_json(report_path, report)
 
     return Phase2RunResult(
         case_id=case_id,
-        report_path=report_path,
-        report=report,
         proposta_json_path=proposta_json_path,
         cnh_json_path=cnh_json_path,
-        inputs=meta["inputs"],
-    )
-
-
-# =============================================================================
-# Phase 2.A — CNH validity
-# =============================================================================
-
-def run_phase2_cnh_validity(
-    *,
-    case_id: str,
-    storage_root: Path = Path("storage"),
-    write_report: bool = True,
-    today: Optional[date] = None,
-) -> Phase2RunResult:
-    cnh_doc = _load_latest_phase1_doc(
-        storage_root=storage_root,
-        case_id=case_id,
-        document_type="cnh",
-    )
-
-    cnh_json_path: Optional[str] = None
-    cnh_data: Dict[str, Any] = {}
-
-    if cnh_doc is not None:
-        cnh_json_path = str(
-            (storage_root / "phase1" / case_id / "cnh").resolve()
-        )
-        data = cnh_doc.get("data") or {}
-        cnh_data = data if isinstance(data, dict) else {}
-
-    meta = {
-        "inputs": {
-            "cnh_json_path": cnh_json_path,
-        }
-    }
-
-    report = build_cnh_validity_report(
-        case_id=case_id,
-        cnh_data=cnh_data,
-        meta=meta,
-        today=today,
-    )
-
-    report_path = storage_root / "phase2" / case_id / "reports" / "cnh_validity.json"
-    if write_report:
-        _write_json(report_path, report)
-
-    return Phase2RunResult(
-        case_id=case_id,
         report_path=report_path,
         report=report,
-        proposta_json_path=None,
-        cnh_json_path=cnh_json_path,
-        inputs=meta["inputs"],
     )
+
+
+def run_phase2_income_declared_vs_proven(
+    *,
+    case_id: str,
+    storage_root: Path = Path("./storage"),
+    write_report: bool = True,
+) -> Phase2IncomeRunResult:
+    """
+    Lê SOMENTE dados persistidos na Phase 1 e gera relatório explicável.
+    - Não bloqueia
+    - Não aprova/reprova
+    """
+    phase1_dir = storage_root / "phase1" / case_id
+
+    proposta_json_path = _pick_latest_json_in_dir(phase1_dir / "proposta_daycoval")
+    holerite_json_path = _pick_latest_json_in_dir(phase1_dir / "holerite")
+    folha_json_path = _pick_latest_json_in_dir(phase1_dir / "folha_pagamento")
+    extrato_json_path = _pick_latest_json_in_dir(phase1_dir / "extrato_bancario")
+
+    proposta_doc, _ = _safe_read_json(proposta_json_path)
+    holerite_doc, _ = _safe_read_json(holerite_json_path)
+    folha_doc, _ = _safe_read_json(folha_json_path)
+    extrato_doc, _ = _safe_read_json(extrato_json_path)
+
+    proposta_data = _get_data_dict(proposta_doc)
+    holerite_data = _get_data_dict(holerite_doc) if holerite_json_path else None
+    folha_data = _get_data_dict(folha_doc) if folha_json_path else None
+    extrato_data = _get_data_dict(extrato_doc) if extrato_json_path else None
+
+    report = build_income_declared_vs_proven_report(
+        case_id=case_id,
+        proposta_data=proposta_data,
+        holerite_data=holerite_data,
+        folha_data=folha_data,
+        extrato_data=extrato_data,
+    )
+
+    # anexa meta de caminhos (útil para auditoria)
+    report.setdefault("meta", {})
+    report["meta"]["inputs"] = {
+        "proposta_json_path": str(proposta_json_path) if proposta_json_path else None,
+        "holerite_json_path": str(holerite_json_path) if holerite_json_path else None,
+        "folha_json_path": str(folha_json_path) if folha_json_path else None,
+        "extrato_json_path": str(extrato_json_path) if extrato_json_path else None,
+    }
+
+    report_path: Optional[Path] = None
+    if write_report:
+        report_path = storage_root / "phase2" / case_id / "reports" / "income_declared_vs_proven.json"
+        _write_json(report_path, report)
+
+    return Phase2IncomeRunResult(
+        case_id=case_id,
+        proposta_json_path=proposta_json_path,
+        holerite_json_path=holerite_json_path,
+        folha_json_path=folha_json_path,
+        extrato_json_path=extrato_json_path,
+        report_path=report_path,
+        report=report,
+    )
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python -m orchestrator.phase2_runner <case_id> [proposta_cnh|income]")
+        raise SystemExit(2)
+
+    cid = sys.argv[1].strip()
+    mode = sys.argv[2].strip() if len(sys.argv) >= 3 else "proposta_cnh"
+
+    if mode == "income":
+        result = run_phase2_income_declared_vs_proven(case_id=cid, storage_root=Path("./storage"), write_report=True)
+        print("case_id:", result.case_id)
+        print("proposta_json_path:", result.proposta_json_path)
+        print("holerite_json_path:", result.holerite_json_path)
+        print("folha_json_path:", result.folha_json_path)
+        print("extrato_json_path:", result.extrato_json_path)
+        print("report_path:", result.report_path)
+        print("summary:", result.report.get("summary"))
+    else:
+        result = run_phase2_proposta_cnh(case_id=cid, storage_root=Path("./storage"), write_report=True)
+        print("case_id:", result.case_id)
+        print("proposta_json_path:", result.proposta_json_path)
+        print("cnh_json_path:", result.cnh_json_path)
+        print("report_path:", result.report_path)
+        print("summary:", result.report.get("summary"))
