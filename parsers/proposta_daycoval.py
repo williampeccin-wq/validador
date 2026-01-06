@@ -29,6 +29,7 @@ class PropostaDaycovalResult:
     empresa: Optional[str] = None
     data_admissao: Optional[str] = None
     salario: Optional[str] = None
+    outras_rendas: Optional[str] = None  # <-- NOVO
     valor_parcela: Optional[str] = None
     debug: Dict[str, Any] = field(default_factory=dict)
 
@@ -38,6 +39,8 @@ class PropostaDaycovalParser:
         r"\b(VENDEDOR|DIVERSOS|BANCO|AGENTE|AGENT/OPER|CARTEIRA|TELEFONE|DADOS\s+PESSOAIS|GRUPO\s+CLIENTE)\b\s*:?",
         flags=re.IGNORECASE,
     )
+
+    _VALOR_BR_RE = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2}")
 
     def parse_text(self, t: str) -> PropostaDaycovalResult:
         res = PropostaDaycovalResult()
@@ -121,7 +124,21 @@ class PropostaDaycovalParser:
         # Atividade profissional
         res.empresa = between("Empresa:", "C.N.P.J")
         res.data_admissao = between("Data Adm.:", "Cargo")
+
+        # Salário: mantém como antes (entre Salário e Outras Rendas)
         res.salario = between("Salário:", "Outras Rendas:")
+
+        # Outras Rendas: NOVO
+        # 1) captura direta por label (mais robusta)
+        outras = find_first(r"\bOutras\s+Rendas\s*:\s*(" + self._VALOR_BR_RE.pattern + r")\b")
+        if outras:
+            res.outras_rendas = outras
+        else:
+            # 2) fallback: pega entre "Outras Rendas:" e "Vlr. Parcela:" se existir
+            outras_fb = between("Outras Rendas:", "Vlr. Parcela:")
+            if outras_fb:
+                m_val = re.search(self._VALOR_BR_RE, outras_fb)
+                res.outras_rendas = m_val.group(0) if m_val else None
 
         # Valor parcela (precisa existir no fixture)
         res.valor_parcela = between("Vlr. Parcela:", "Taxa Nominal")
