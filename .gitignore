@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.streamlit/
+*.log
+tmp/
+outputs/
+
+# Private fixtures (do not commit)
+tests/fixtures_private/

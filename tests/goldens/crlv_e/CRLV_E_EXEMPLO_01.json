@@ -1,0 +1,40 @@
+{
+  "ano_fabricacao": null,
+  "ano_modelo": null,
+  "categoria": "CAPACIDADE",
+  "chassi": "9BFZF55P898396756",
+  "combustivel": "ÍVEL REPASSE OBRIGATÓRIO AO VALOR DO IOF (R$) VALOR TOTAL A SER PAGO",
+  "cor": "PREDOMINANTE COMBUSTÍVEL REPASSE OBRIGATÓRIO AO VALOR DO IOF (R$) VALOR TOTAL A SER PAGO",
+  "data_emissao": "08/06/2023",
+  "debug": {
+    "checks": {
+      "renavam": {
+        "dv_ok": true,
+        "normalized": "00133070786",
+        "raw": "00133070786",
+        "reason": "ok"
+      }
+    },
+    "min_text_len_threshold": 800,
+    "mode": "native",
+    "native_text_len": 2066,
+    "ocr_dpi": 300,
+    "ocr_text_len": 0,
+    "pages": [
+      {
+        "native_len": 2066,
+        "ocr_len": 0,
+        "page": 1
+      }
+    ],
+    "warnings": []
+  },
+  "local_emissao": "DATA",
+  "marca_modelo": null,
+  "mode": "native",
+  "placa": "MHA7923",
+  "proprietario_doc": null,
+  "proprietario_nome": null,
+  "renavam": "00133070786",
+  "uf_licenciamento": "CHASSI"
+}
