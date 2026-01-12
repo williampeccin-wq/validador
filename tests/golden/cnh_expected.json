@@ -1,0 +1,12 @@
+{
+  "nome": "ANDERSON SANTOS DE BARROS",
+  "cpf": "05775072901",
+  "data_nascimento": "12/07/1987",
+  "cidade_nascimento": "Florianopolis",
+  "uf_nascimento": "SC",
+  "validade": "21/07/2032",
+  "filiacao": [
+    "EDSON ESPINDOLA DE BARROS",
+    "SONIA MARIA DOS SANTOS"
+  ]
+}
