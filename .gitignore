@@ -9,3 +9,6 @@ outputs/
 
 # Private fixtures (do not commit)
 tests/fixtures_private/
+
+# Runtime artifacts
+storage/
