@@ -2,15 +2,8 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Union
-
-from validators.phase2.income_declared_vs_proven_validator import (
-    build_income_declared_vs_proven_report,
-)
-from validators.phase2.master_report import build_master_report
-from validators.phase2.proposta_cnh_validator import build_proposta_cnh_report
+from typing import Any, Dict, Optional, Tuple
 
 
 JsonDict = Dict[str, Any]
@@ -30,35 +23,33 @@ class Phase2MasterReportResult:
     report_path: Path
 
 
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _safe_read_json(path: Path) -> Optional[JsonDict]:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
-
-def _pick_latest_json(dir_path: Path) -> Optional[Path]:
-    """Pick latest JSON in directory using (mtime, name) ordering."""
+def _pick_latest_json_in_dir(dir_path: Path) -> Optional[Path]:
     if not dir_path.exists() or not dir_path.is_dir():
         return None
-    candidates = sorted(
+    # robusto: ordena por mtime e depois por nome (estável)
+    files = sorted(
         [p for p in dir_path.glob("*.json") if p.is_file()],
         key=lambda p: (p.stat().st_mtime, p.name),
     )
-    return candidates[-1] if candidates else None
+    return files[-1] if files else None
+
+
+def _safe_read_json(path: Optional[Path]) -> Tuple[Optional[JsonDict], Optional[str]]:
+    if path is None:
+        return None, "missing_file"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), None
+    except Exception as e:
+        return None, str(e)
 
 
 def _extract_data(doc_json: Optional[JsonDict]) -> Optional[JsonDict]:
-    """Tolerate Phase 1 envelopes and raw payloads.
+    """
+    Phase 1 geralmente persiste envelope:
+      { "document_type": "...", "data": {...}, "debug": {...}, ... }
 
-    Phase 1 commonly persists:
-      {"document_type": "...", "data": {...}, "debug": {...}, ...}
-
-    But older fixtures/tests may persist the data directly.
+    Alguns testes/fixtures podem persistir o payload direto.
+    Este helper tolera os dois.
     """
     if not doc_json:
         return None
@@ -68,61 +59,39 @@ def _extract_data(doc_json: Optional[JsonDict]) -> Optional[JsonDict]:
     return doc_json
 
 
-def _phase1_doc_paths(case_id: str, storage_root: Path) -> Tuple[Optional[Path], Optional[Path]]:
-    phase1_case_dir = storage_root / "phase1" / case_id
-    proposta_json_path = _pick_latest_json(phase1_case_dir / "proposta_daycoval")
-    cnh_json_path = _pick_latest_json(phase1_case_dir / "cnh")
-    return proposta_json_path, cnh_json_path
-
-
 def run_phase2_proposta_cnh(
     *,
     case_id: str,
-    storage_root: Union[str, Path] = Path("storage"),
+    storage_root: Path = Path("./storage"),
     write_report: bool = True,
 ) -> Phase2RunResult:
-    """Run Phase 2 validator: Proposta ↔ CNH.
-
-    Reads the latest Phase 1 JSONs under:
-      <storage_root>/phase1/<case_id>/proposta_daycoval/*.json
-      <storage_root>/phase1/<case_id>/cnh/*.json
-
-    Writes report to:
-      <storage_root>/phase2/<case_id>/reports/proposta_vs_cnh.json
     """
-    storage_root = Path(storage_root)
+    Lê Phase 1 em:
+      storage_root/phase1/<case_id>/proposta_daycoval/*.json
+      storage_root/phase1/<case_id>/cnh/*.json
 
-    proposta_json_path, cnh_json_path = _phase1_doc_paths(case_id, storage_root)
+    Escreve Phase 2 em:
+      storage_root/phase2/<case_id>/reports/proposta_vs_cnh.json
+    """
+    from validators.phase2.proposta_cnh_validator import build_proposta_cnh_report
 
-    proposta_raw = _safe_read_json(proposta_json_path) if proposta_json_path else None
-    cnh_raw = _safe_read_json(cnh_json_path) if cnh_json_path else None
+    phase1_dir = storage_root / "phase1" / case_id
+    proposta_dir = phase1_dir / "proposta_daycoval"
+    cnh_dir = phase1_dir / "cnh"
 
-    proposta_data = _extract_data(proposta_raw)
-    cnh_data = _extract_data(cnh_raw)
+    proposta_json_path = _pick_latest_json_in_dir(proposta_dir)
+    cnh_json_path = _pick_latest_json_in_dir(cnh_dir)
 
-    report: JsonDict = build_proposta_cnh_report(
+    proposta_doc, _ = _safe_read_json(proposta_json_path)
+    cnh_doc, _ = _safe_read_json(cnh_json_path)
+
+    proposta_data = _extract_data(proposta_doc)
+    cnh_data = _extract_data(cnh_doc)
+
+    report = build_proposta_cnh_report(
         case_id=case_id,
         proposta_data=proposta_data,
         cnh_data=cnh_data,
-    )
-
-    # Runner-level meta (paths). This keeps provenance even if validator contract evolves.
-    report.setdefault("meta", {})
-    report["meta"].setdefault("inputs", {})
-    report["meta"]["inputs"].update(
-        {
-            "proposta_json_path": str(proposta_json_path) if proposta_json_path else None,
-            "cnh_json_path": str(cnh_json_path) if cnh_json_path else None,
-        }
-    )
-    report["meta"].setdefault("runner", {})
-    report["meta"]["runner"].update(
-        {
-            "storage_root": str(storage_root),
-            "phase": "phase2",
-            "runner": "run_phase2_proposta_cnh",
-            "generated_at": _utc_iso(),
-        }
     )
 
     report_path: Optional[Path] = None
@@ -146,64 +115,70 @@ def run_phase2_proposta_cnh(
 def run_phase2_income_declared_vs_proven(
     *,
     case_id: str,
-    storage_root: Union[str, Path] = Path("storage"),
+    storage_root: Path = Path("./storage"),
     write_report: bool = True,
 ) -> Phase2RunResult:
-    """Run Phase 2 validator: income declared vs proven (Proposta ↔ opcionais).
-
-    Today, this runner only wires the Proposta (declared) because Phase 1 optionals
-    (holerite/extrato) may not exist yet for a given case.
     """
-    storage_root = Path(storage_root)
-    phase1_case_dir = storage_root / "phase1" / case_id
+    Lê Phase 1 em:
+      storage_root/phase1/<case_id>/proposta_daycoval/*.json
+      storage_root/phase1/<case_id>/holerite/*.json   (opcional)
+      storage_root/phase1/<case_id>/extrato_bancario/*.json (opcional)
 
-    proposta_json_path = _pick_latest_json(phase1_case_dir / "proposta_daycoval")
-    proposta_raw = _safe_read_json(proposta_json_path) if proposta_json_path else None
-    proposta_data = _extract_data(proposta_raw)
+    Escreve Phase 2 em:
+      storage_root/phase2/<case_id>/reports/income_declared_vs_proven.json
+    """
+    from validators.phase2.income_declared_vs_proven_validator import (
+        build_income_declared_vs_proven_report,
+    )
+
+    phase1_dir = storage_root / "phase1" / case_id
+
+    proposta_json_path = _pick_latest_json_in_dir(phase1_dir / "proposta_daycoval")
+    holerite_json_path = _pick_latest_json_in_dir(phase1_dir / "holerite")
+    extrato_json_path = _pick_latest_json_in_dir(phase1_dir / "extrato_bancario")
+
+    proposta_doc, _ = _safe_read_json(proposta_json_path)
+    holerite_doc, _ = _safe_read_json(holerite_json_path)
+    extrato_doc, _ = _safe_read_json(extrato_json_path)
+
+    proposta_data = _extract_data(proposta_doc)
+    holerite_data = _extract_data(holerite_doc)
+    extrato_data = _extract_data(extrato_doc)
 
     report: JsonDict
-    if not proposta_data:
-        # Minimal, non-blocking report when Proposta is missing.
+    if proposta_data is None:
+        # Sem proposta não existe "declarado" para comparar; devolve report não-bloqueante e explicável.
         report = {
             "case_id": case_id,
             "validator": "income_declared_vs_proven",
-            "created_at": _utc_iso(),
-            "summary": {"missing": 1, "note": "missing proposta_daycoval"},
-            "sections": [
-                {
-                    "id": "minimum_inputs",
-                    "title": "Inputs mínimos",
-                    "status": "MISSING",
-                    "expected": "proposta_daycoval",
-                    "found": {"proposta_daycoval": False},
-                }
-            ],
+            "created_at": None,
+            "summary": {
+                "status": "MISSING",
+                "explain": "Sem proposta_daycoval no Phase 1 não há renda declarada para comparar.",
+            },
+            "inputs": {
+                "proposta_daycoval": str(proposta_json_path) if proposta_json_path else None,
+                "holerite": str(holerite_json_path) if holerite_json_path else None,
+                "extrato_bancario": str(extrato_json_path) if extrato_json_path else None,
+            },
         }
     else:
         report = build_income_declared_vs_proven_report(
             case_id=case_id,
             proposta_data=proposta_data,
-            holerite_data=None,
-            extrato_data=None,
+            holerite_data=holerite_data,
+            extrato_data=extrato_data,
         )
 
-    report.setdefault("meta", {})
-    report["meta"].setdefault("inputs", {})
-    report["meta"]["inputs"].update(
-        {
-            "proposta_json_path": str(proposta_json_path) if proposta_json_path else None,
-            "phase1_case_dir": str(phase1_case_dir),
-        }
-    )
-    report["meta"].setdefault("runner", {})
-    report["meta"]["runner"].update(
-        {
-            "storage_root": str(storage_root),
-            "phase": "phase2",
-            "runner": "run_phase2_income_declared_vs_proven",
-            "generated_at": _utc_iso(),
-        }
-    )
+        # runner-level inputs (proveniência)
+        report.setdefault("inputs", {})
+        report["inputs"].update(
+            {
+                "proposta_daycoval": str(proposta_json_path) if proposta_json_path else None,
+                "holerite": str(holerite_json_path) if holerite_json_path else None,
+                "extrato_bancario": str(extrato_json_path) if extrato_json_path else None,
+            }
+        )
 
     report_path: Optional[Path] = None
     if write_report:
@@ -226,22 +201,21 @@ def run_phase2_income_declared_vs_proven(
 def run_phase2_master_report(
     *,
     case_id: str,
-    storage_root: Union[str, Path] = Path("storage"),
+    storage_root: Path = Path("./storage"),
 ) -> Phase2MasterReportResult:
-    """Build and persist the Phase 2 master report.
-
-    Calls validators.phase2.master_report.build_master_report(case_id, ...), which:
-      - loads latest Phase 1 inputs (if present)
-      - computes checks + summary
-      - persists to: <phase2_root>/<case_id>/report.json
-
-    Safe even when Phase 1 storage is empty.
     """
-    storage_root = Path(storage_root)
+    Integra o Master Report ao orquestrador.
+
+    - Usa validators.phase2.master_report.build_master_report (entrypoint real do projeto)
+    - Sempre persiste em: storage_root/phase2/<case_id>/report.json
+    - É seguro com Phase 1 vazio (gera checks MISSING)
+    """
+    from validators.phase2.master_report import build_master_report
+
     phase1_root = str(storage_root / "phase1")
     phase2_root = str(storage_root / "phase2")
 
-    _ = build_master_report(case_id, phase1_root=phase1_root, phase2_root=phase2_root)
+    build_master_report(case_id, phase1_root=phase1_root, phase2_root=phase2_root)
 
-    report_path = Path(phase2_root) / case_id / "report.json"
+    report_path = storage_root / "phase2" / case_id / "report.json"
     return Phase2MasterReportResult(case_id=case_id, report_path=report_path)
