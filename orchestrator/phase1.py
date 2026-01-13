@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple, Callable, Union
+from typing import Any, Dict, Optional, List, Tuple, Callable
 
 
 # ======================================================================================
@@ -24,9 +24,13 @@ from typing import Any, Dict, Optional, List, Tuple, Callable, Union
 # - Em qualquer falha de extração/parse, registrar debug e seguir.
 #
 # Nota importante (portabilidade): em ambientes sem Poppler/Tesseract
-# (ex.: CI), OCR pode não estar disponível. Por padrão, a Fase 1 não
-# força OCR; ela usa texto nativo de PDF quando disponível.
-# OCR pode ser habilitado via PHASE1_ENABLE_OCR=1.
+# (ex.: CI), OCR pode não estar disponível. A Fase 1 é tolerante:
+# tenta OCR quando configurado/necessário, mas nunca bloqueia o fluxo.
+#
+# Ajuste CNH (Gate 1):
+# - CNH frequentemente tem texto nativo curto/“serpro-only”.
+# - Para CNH, se o texto nativo for menor que o threshold, tentamos OCR
+#   automaticamente (mesmo que PHASE1_ENABLE_OCR=0). Se falhar, seguimos.
 # ======================================================================================
 
 
@@ -89,44 +93,82 @@ def _extract_text_native_pdf(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
         return "", dbg
 
 
-def _extract_text_phase1(file_path: str, raw: "RawPayload") -> Tuple[str, Dict[str, Any]]:
+def _extract_text_phase1(
+    file_path: str,
+    raw: "RawPayload",
+    *,
+    force_ocr_on_short_native: bool = False,
+) -> Tuple[str, Dict[str, Any]]:
     """
     Extrai texto de forma não-bloqueante.
 
-    Regra: por padrão, usa somente texto nativo de PDF.
-    OCR só roda se PHASE1_ENABLE_OCR=1.
+    Regras:
+    - PDF: tenta texto nativo primeiro.
+      - Se nativo for "suficiente", retorna nativo.
+      - Se nativo for curto (< threshold), pode tentar OCR:
+        - se PHASE1_ENABLE_OCR=1, tenta OCR
+        - se force_ocr_on_short_native=True, tenta OCR mesmo com PHASE1_ENABLE_OCR=0 (CNH)
+      - Em falhas de OCR (Poppler/Tesseract ausentes etc.), segue com nativo.
+    - Imagem: OCR somente se PHASE1_ENABLE_OCR=1 (mantém comportamento atual).
     """
     enable_ocr = _env_truthy("PHASE1_ENABLE_OCR", default="0")
 
+    ocr_cfg = _default_ocr_config()
+    min_len = int(ocr_cfg["min_text_len_threshold"])
+    ocr_dpi = int(ocr_cfg["ocr_dpi"])
+
     # PDF: texto nativo primeiro (portável)
     if (raw.mime_type or "").lower() == "application/pdf" or raw.filename.lower().endswith(".pdf"):
-        native_text, dbg_native = _extract_text_native_pdf(base64.b64decode(raw.content_b64))
-        if native_text or not enable_ocr:
+        pdf_bytes = base64.b64decode(raw.content_b64)
+        native_text, dbg_native = _extract_text_native_pdf(pdf_bytes)
+
+        # Enriquecer debug do native com thresholds (para inspeção)
+        dbg_native = dict(dbg_native or {})
+        dbg_native.setdefault("mode", "native")
+        dbg_native["min_text_len_threshold"] = min_len
+        dbg_native["ocr_dpi"] = ocr_dpi
+
+        native_len = int(dbg_native.get("native_text_len") or len(native_text or ""))
+
+        # Decide OCR
+        should_try_ocr = (native_len < min_len) and (enable_ocr or force_ocr_on_short_native)
+
+        if not should_try_ocr:
+            dbg_native["chosen_mode"] = "native"
             return native_text, {"extractor": dbg_native, "ocr": None}
 
-        # OCR opcional
-        ocr_cfg = _default_ocr_config()
+        # OCR (tolerante)
         try:
             from core.ocr import extract_text_any
 
-            text, dbg = extract_text_any(
-                file_bytes=base64.b64decode(raw.content_b64),
+            text_any, dbg_ocr = extract_text_any(
+                file_bytes=pdf_bytes,
                 filename=raw.filename,
                 tesseract_cmd=ocr_cfg["tesseract_cmd"],
                 poppler_path=ocr_cfg["poppler_path"],
-                min_text_len_threshold=int(ocr_cfg["min_text_len_threshold"]),
-                ocr_dpi=int(ocr_cfg["ocr_dpi"]),
+                min_text_len_threshold=min_len,
+                ocr_dpi=ocr_dpi,
             )
-            return (text or ""), {"extractor": dbg_native, "ocr": dbg}
+            # Se OCR devolveu algo melhor, usamos; senão, volta no native
+            final_text = (text_any or "").strip() or (native_text or "").strip()
+
+            dbg_native["chosen_mode"] = "ocr" if (final_text and final_text != (native_text or "").strip()) else "native"
+            # Mantém compat: extractor=native, ocr=dbg do extract_text_any
+            return final_text, {"extractor": dbg_native, "ocr": dbg_ocr}
         except Exception as e:
+            dbg_native["chosen_mode"] = "native_fallback"
             return native_text, {
                 "extractor": dbg_native,
-                "ocr": {"error": f"{type(e).__name__}: {e}", "enabled": True},
+                "ocr": {
+                    "error": f"{type(e).__name__}: {e}",
+                    "enabled": True,
+                    "min_text_len_threshold": min_len,
+                    "ocr_dpi": ocr_dpi,
+                },
             }
 
-    # Imagem: OCR somente se habilitado
+    # Imagem: OCR somente se habilitado (mantém comportamento atual)
     if enable_ocr:
-        ocr_cfg = _default_ocr_config()
         try:
             from core.ocr import extract_text_any
 
@@ -135,8 +177,8 @@ def _extract_text_phase1(file_path: str, raw: "RawPayload") -> Tuple[str, Dict[s
                 filename=raw.filename,
                 tesseract_cmd=ocr_cfg["tesseract_cmd"],
                 poppler_path=ocr_cfg["poppler_path"],
-                min_text_len_threshold=int(ocr_cfg["min_text_len_threshold"]),
-                ocr_dpi=int(ocr_cfg["ocr_dpi"]),
+                min_text_len_threshold=min_len,
+                ocr_dpi=ocr_dpi,
             )
             return (text or ""), {"extractor": {"mode": "image_ocr"}, "ocr": dbg}
         except Exception as e:
@@ -400,7 +442,11 @@ def collect_document(
         if parser is not None:
             # 1) extrair texto (não-bloqueante)
             try:
-                raw_text, extractor_debug = _extract_text_phase1(file_path, raw)
+                raw_text, extractor_debug = _extract_text_phase1(
+                    file_path,
+                    raw,
+                    force_ocr_on_short_native=(dt == DocumentType.CNH),
+                )
             except Exception as e:
                 raw_text = ""
                 extractor_debug = {"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
