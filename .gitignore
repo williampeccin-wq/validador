@@ -12,3 +12,15 @@ tests/fixtures_private/
 
 # Runtime artifacts
 storage/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+
+# runtime outputs
+storage/
