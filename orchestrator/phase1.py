@@ -12,15 +12,46 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple, Callable
+from typing import Any, Dict, Optional, List, Tuple, Callable, Union
 
 
 # ======================================================================================
-# Helpers
+# Phase 1 text extraction (NON-BLOCKING)
+#
+# Objetivo (Opção A): estabilizar a captura.
+# - Sempre persistir o bruto.
+# - Tentar extrair texto e parsear quando possível.
+# - Em qualquer falha de extração/parse, registrar debug e seguir.
+#
+# Nota importante (portabilidade): em ambientes sem Poppler/Tesseract
+# (ex.: CI), OCR pode não estar disponível. Por padrão, a Fase 1 não
+# força OCR; ela usa texto nativo de PDF quando disponível.
+# OCR pode ser habilitado via PHASE1_ENABLE_OCR=1.
+# ======================================================================================
+
+
+# ======================================================================================
+# Storage / config
 # ======================================================================================
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _storage_root() -> Path:
+    """
+    Default: storage/phase1
+    Pode ser sobrescrito por env var PHASE1_STORAGE_ROOT (útil para testes).
+    """
+    return Path(os.getenv("PHASE1_STORAGE_ROOT", "storage/phase1"))
+
+
+def _set_storage_root(storage_root: str | Path) -> None:
+    os.environ["PHASE1_STORAGE_ROOT"] = str(storage_root)
+
+
+def _has_any_json(d: Path) -> bool:
+    return d.exists() and any(p.suffix == ".json" for p in d.iterdir() if p.is_file())
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -28,43 +59,8 @@ def _env_truthy(name: str, default: str = "0") -> bool:
     return v in {"1", "true", "yes", "y", "on"}
 
 
-def _normalize_phase1_root(storage_root: str | Path | None) -> Path:
-    """
-    Normaliza o root do Phase 1 para evitar divergência entre:
-      - passar ".../storage"  (pai)
-      - passar ".../storage/phase1" (direto)
-
-    Regra:
-      - se None: usa env PHASE1_STORAGE_ROOT ou "storage/phase1"
-      - se path basename == "phase1": usa como root
-      - caso contrário: usa "<path>/phase1" como root
-    """
-    if storage_root is None:
-        return Path(os.getenv("PHASE1_STORAGE_ROOT", "storage/phase1"))
-
-    p = Path(storage_root)
-    if p.name == "phase1":
-        return p
-
-    # Se o usuário passou o diretório pai ("storage"), isso vira "storage/phase1"
-    return p / "phase1"
-
-
-def _set_phase1_root(storage_root: str | Path | None) -> Path:
-    root = _normalize_phase1_root(storage_root)
-    os.environ["PHASE1_STORAGE_ROOT"] = str(root)
-    return root
-
-
-def _phase1_root() -> Path:
-    return _normalize_phase1_root(None)
-
-
-def _has_any_json(d: Path) -> bool:
-    return d.exists() and any(p.suffix == ".json" for p in d.iterdir() if p.is_file())
-
-
 def _default_ocr_config() -> Dict[str, Any]:
+    """Defaults compatíveis com o app.py (mas sem depender de Streamlit)."""
     return {
         "tesseract_cmd": os.getenv("TESSERACT_CMD", "/opt/homebrew/bin/tesseract"),
         "poppler_path": os.getenv("POPPLER_PATH", "/opt/homebrew/bin"),
@@ -73,11 +69,8 @@ def _default_ocr_config() -> Dict[str, Any]:
     }
 
 
-# ======================================================================================
-# Phase 1 text extraction (NON-BLOCKING)
-# ======================================================================================
-
 def _extract_text_native_pdf(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
+    """Extrai texto nativo de PDF via pdfplumber (sem OCR)."""
     dbg: Dict[str, Any] = {"mode": "native", "pages": None, "native_text_len": 0}
     try:
         import io
@@ -100,25 +93,24 @@ def _extract_text_phase1(file_path: str, raw: "RawPayload") -> Tuple[str, Dict[s
     """
     Extrai texto de forma não-bloqueante.
 
-    - PDF: tenta texto nativo primeiro.
-    - OCR: só roda se PHASE1_ENABLE_OCR=1.
+    Regra: por padrão, usa somente texto nativo de PDF.
+    OCR só roda se PHASE1_ENABLE_OCR=1.
     """
     enable_ocr = _env_truthy("PHASE1_ENABLE_OCR", default="0")
 
-    is_pdf = (raw.mime_type or "").lower() == "application/pdf" or raw.filename.lower().endswith(".pdf")
-    content = base64.b64decode(raw.content_b64)
-
-    if is_pdf:
-        native_text, dbg_native = _extract_text_native_pdf(content)
+    # PDF: texto nativo primeiro (portável)
+    if (raw.mime_type or "").lower() == "application/pdf" or raw.filename.lower().endswith(".pdf"):
+        native_text, dbg_native = _extract_text_native_pdf(base64.b64decode(raw.content_b64))
         if native_text or not enable_ocr:
             return native_text, {"extractor": dbg_native, "ocr": None}
 
+        # OCR opcional
         ocr_cfg = _default_ocr_config()
         try:
             from core.ocr import extract_text_any
 
             text, dbg = extract_text_any(
-                file_bytes=content,
+                file_bytes=base64.b64decode(raw.content_b64),
                 filename=raw.filename,
                 tesseract_cmd=ocr_cfg["tesseract_cmd"],
                 poppler_path=ocr_cfg["poppler_path"],
@@ -132,14 +124,14 @@ def _extract_text_phase1(file_path: str, raw: "RawPayload") -> Tuple[str, Dict[s
                 "ocr": {"error": f"{type(e).__name__}: {e}", "enabled": True},
             }
 
-    # imagem: OCR apenas se habilitado
+    # Imagem: OCR somente se habilitado
     if enable_ocr:
         ocr_cfg = _default_ocr_config()
         try:
             from core.ocr import extract_text_any
 
             text, dbg = extract_text_any(
-                file_bytes=content,
+                file_bytes=base64.b64decode(raw.content_b64),
                 filename=raw.filename,
                 tesseract_cmd=ocr_cfg["tesseract_cmd"],
                 poppler_path=ocr_cfg["poppler_path"],
@@ -154,85 +146,72 @@ def _extract_text_phase1(file_path: str, raw: "RawPayload") -> Tuple[str, Dict[s
 
 
 # ======================================================================================
-# Document types (canonicalização)
+# Document types
 # ======================================================================================
 
 class DocumentType(str, Enum):
+    # Gate 1
     PROPOSTA_DAYCOVAL = "proposta_daycoval"
     CNH = "cnh"
 
-    # Canonical: holerite engloba folha/contracheque
+    # Opcionais na Fase 1 (não alteram Gate 1)
     HOLERITE = "holerite"
-
+    FOLHA_PAGAMENTO = "folha_pagamento"
     EXTRATO_BANCARIO = "extrato_bancario"
-
-
-# aliases aceitos na entrada; todos convergem para HOLERITE
-_HOLERITE_ALIASES = {
-    "holerite",
-    "folha_pagamento",
-    "folha de pagamento",
-    "folha",
-    "contracheque",
-    "contra_cheque",
-    "contra-cheque",
-}
-
-
-def _canonical_document_type(document_type: str | DocumentType) -> DocumentType:
-    if isinstance(document_type, DocumentType):
-        return document_type
-
-    s = (document_type or "").strip().lower()
-    if s in _HOLERITE_ALIASES:
-        return DocumentType.HOLERITE
-    if s == "proposta_daycoval":
-        return DocumentType.PROPOSTA_DAYCOVAL
-    if s == "cnh":
-        return DocumentType.CNH
-    if s == "extrato_bancario":
-        return DocumentType.EXTRATO_BANCARIO
-
-    raise ValueError(f"Unknown document_type: {document_type!r}")
 
 
 OPTIONAL_DOCS: set[DocumentType] = {
     DocumentType.HOLERITE,
+    DocumentType.FOLHA_PAGAMENTO,
     DocumentType.EXTRATO_BANCARIO,
 }
 
 
 # ======================================================================================
-# CaseStatus
+# CaseStatus (contrato esperado pelos testes)
 # ======================================================================================
 
 @dataclass(frozen=True)
 class CaseStatus:
     case_id: str
+
+    # Gate 1 inventory
     has_proposta_daycoval: bool
     has_cnh: bool
+
+    # Gate 1 control
     gate1_ready: bool
     is_complete: bool
+
+    # Gate 1 missing (EXPLÍCITO NOS TESTES)
     missing: List[str]
 
+    # Opcionais (informativo)
     has_holerite: bool
+    has_folha_pagamento: bool
     has_extrato_bancario: bool
 
+    # Inventário bruto
     types: Dict[str, List[str]]
 
 
 # ======================================================================================
-# Parser loading (lazy)
+# Parser loading (não bloqueante e SEM importar tudo)
 # ======================================================================================
 
 ParserFn = Callable[..., Any]
 
 
 def _parser_specs() -> Dict[DocumentType, Tuple[str, str]]:
+    """
+    Mapeia document_type -> (module, function)
+    Importamos somente o parser do tipo solicitado, para evitar travamentos.
+    """
     return {
         DocumentType.PROPOSTA_DAYCOVAL: ("parsers.proposta_daycoval", "analyze_proposta_daycoval"),
         DocumentType.CNH: ("parsers.cnh", "analyze_cnh"),
         DocumentType.HOLERITE: ("parsers.holerite", "analyze_holerite"),
+        DocumentType.FOLHA_PAGAMENTO: ("parsers.folha_pagamento", "analyze_folha_pagamento"),
         DocumentType.EXTRATO_BANCARIO: ("parsers.extrato_bancario", "analyze_extrato_bancario"),
     }
 
@@ -258,9 +237,14 @@ def _invoke_parser(
     filename: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """
-    Invoca parser tolerando assinaturas diferentes.
+    Invoca o parser de forma tolerante a variações de assinatura.
 
-    Fix principal: suporta parâmetro `text` (holerite) além de `raw_text`.
+    Contratos encontrados no projeto:
+    - analyze_proposta_daycoval(raw_text: str, ...) -> dict
+    - analyze_cnh(raw_text=..., ...) -> (dict, dbg)
+    - parsers antigos podem aceitar (file_path: str) -> dict
+
+    Retorna: (fields, parser_debug)
     """
     try:
         import inspect
@@ -268,49 +252,14 @@ def _invoke_parser(
         sig = inspect.signature(parser)
         params = sig.parameters
 
-        kwargs: Dict[str, Any] = {}
-        args: List[Any] = []
-
-        # Texto
+        # Caso 1: aceita raw_text (keyword ou positional)
         if "raw_text" in params:
-            kwargs["raw_text"] = raw_text or ""
-        elif "text" in params:
-            kwargs["text"] = raw_text or ""
-        elif "document_text" in params:
-            kwargs["document_text"] = raw_text or ""
-        elif "conteudo" in params:
-            kwargs["conteudo"] = raw_text or ""
+            out = parser(raw_text=raw_text or "", filename=filename)
+        else:
+            # Caso 2: assume API antiga por caminho
+            out = parser(file_path)
 
-        # Caminho
-        if "file_path" in params:
-            kwargs["file_path"] = file_path
-        elif "path" in params:
-            kwargs["path"] = file_path
-
-        # Metadados
-        if "filename" in params:
-            kwargs["filename"] = filename
-        elif "file_name" in params:
-            kwargs["file_name"] = filename
-
-        # Fallback posicional se nada encaixou
-        if not kwargs:
-            pnames = list(params.keys())
-            if len(pnames) == 1:
-                pname = pnames[0].lower()
-                if "path" in pname or "file" in pname:
-                    args = [file_path]
-                else:
-                    args = [raw_text or ""]
-            else:
-                first = pnames[0].lower()
-                if "path" in first or "file" in first:
-                    args = [file_path]
-                else:
-                    args = [raw_text or ""]
-
-        out = parser(*args, **kwargs)
-
+        # Normaliza retorno
         if isinstance(out, tuple) and len(out) == 2 and isinstance(out[0], dict) and isinstance(out[1], dict):
             return out[0], out[1]
         if isinstance(out, dict):
@@ -322,7 +271,7 @@ def _invoke_parser(
 
 
 # ======================================================================================
-# Raw payload + persistence
+# Payload bruto + persistência
 # ======================================================================================
 
 @dataclass(frozen=True)
@@ -386,8 +335,8 @@ def _build_doc_record(
     }
 
 
-def _write_doc_json(phase1_root: Path, case_id: str, document_type: DocumentType, doc_id: str, doc: Dict[str, Any]) -> Path:
-    out_dir = phase1_root / case_id / document_type.value
+def _write_doc_json(case_id: str, document_type: DocumentType, doc_id: str, doc: Dict[str, Any]) -> Path:
+    out_dir = _storage_root() / case_id / document_type.value
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{doc_id}.json"
     out_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -395,16 +344,15 @@ def _write_doc_json(phase1_root: Path, case_id: str, document_type: DocumentType
 
 
 # ======================================================================================
-# Public API
+# Public API (Fase 1)
 # ======================================================================================
 
 def start_case(*, storage_root: str | Path | None = None) -> str:
     """
-    Aceita:
-      - storage_root=".../storage"        -> usa ".../storage/phase1"
-      - storage_root=".../storage/phase1" -> usa direto
+    Compat com testes: aceita storage_root (ex.: .../storage/phase1).
     """
-    _set_phase1_root(storage_root)
+    if storage_root is not None:
+        _set_storage_root(storage_root)
     return str(uuid.uuid4())
 
 
@@ -418,14 +366,22 @@ def collect_document(
     """
     Coleta e persiste um documento na Fase 1.
 
-    - Sempre persiste bruto.
-    - Parsing opcional para docs opcionais via PHASE1_PARSE_OPTIONAL_DOCS=1.
-    - Canonicalização: folha/contracheque => holerite.
-    """
-    phase1_root = _set_phase1_root(storage_root)
+    Regras:
+    - Não bloquear fluxo (sempre persiste bruto; parser pode falhar / pode ser pulado).
+    - Não aprovar/reprovar.
+    - Estrutura: storage/phase1/<case_id>/<document_type>/<doc_id>.json
 
-    dt = _canonical_document_type(document_type)
+    Importante:
+    - Por padrão, NÃO fazemos parsing dos docs opcionais (holerite/folha/extrato) na Fase 1,
+      para evitar travamentos e porque as inferências/validações rodam depois.
+    - Se você quiser forçar parsing dos opcionais: export PHASE1_PARSE_OPTIONAL_DOCS=1
+    """
+    if storage_root is not None:
+        _set_storage_root(storage_root)
+
+    dt = DocumentType(document_type) if not isinstance(document_type, DocumentType) else document_type
     doc_id = str(uuid.uuid4())
+
     raw = _read_file_as_raw_payload(file_path)
 
     parsed: Optional[Dict[str, Any]] = None
@@ -442,12 +398,14 @@ def collect_document(
     if should_parse:
         parser = _load_parser_for(dt)
         if parser is not None:
+            # 1) extrair texto (não-bloqueante)
             try:
                 raw_text, extractor_debug = _extract_text_phase1(file_path, raw)
             except Exception as e:
                 raw_text = ""
                 extractor_debug = {"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
 
+            # 2) invocar parser (tolerante a assinatura)
             parsed, parser_debug = _invoke_parser(
                 parser,
                 file_path=file_path,
@@ -455,6 +413,7 @@ def collect_document(
                 filename=raw.filename,
             )
 
+            # 3) se parser retornou warning/error, promover para parse_error (sem quebrar)
             if parser_debug and ("error" in parser_debug):
                 parse_error = {
                     "message": parser_debug.get("error"),
@@ -485,19 +444,25 @@ def collect_document(
         parser_debug=parser_debug,
     )
 
-    _write_doc_json(phase1_root, case_id, dt, doc_id, doc)
+    _write_doc_json(case_id, dt, doc_id, doc)
     return doc
 
 
-def gate1_is_ready(case_id: str, *, storage_root: str | Path | None = None) -> bool:
-    phase1_root = _set_phase1_root(storage_root)
-    root = phase1_root / case_id
+def gate1_is_ready(case_id: str) -> bool:
+    """
+    Gate 1 INTACTO: apenas Proposta Daycoval + CNH.
+    """
+    root = _storage_root() / case_id
     return _has_any_json(root / DocumentType.PROPOSTA_DAYCOVAL.value) and _has_any_json(root / DocumentType.CNH.value)
 
 
-def case_status(case_id: str, *, storage_root: str | Path | None = None) -> CaseStatus:
-    phase1_root = _set_phase1_root(storage_root)
-    root = phase1_root / case_id
+def case_status(case_id: str) -> CaseStatus:
+    """
+    Contrato esperado pelos testes:
+    - st.is_complete
+    - st.missing contém tipos faltantes do Gate 1
+    """
+    root = _storage_root() / case_id
 
     proposta_dir = root / DocumentType.PROPOSTA_DAYCOVAL.value
     cnh_dir = root / DocumentType.CNH.value
@@ -514,6 +479,7 @@ def case_status(case_id: str, *, storage_root: str | Path | None = None) -> Case
     gate1_ready = has_proposta and has_cnh
 
     has_holerite = _has_any_json(root / DocumentType.HOLERITE.value)
+    has_folha = _has_any_json(root / DocumentType.FOLHA_PAGAMENTO.value)
     has_extrato = _has_any_json(root / DocumentType.EXTRATO_BANCARIO.value)
 
     types: Dict[str, List[str]] = {}
@@ -533,6 +499,7 @@ def case_status(case_id: str, *, storage_root: str | Path | None = None) -> Case
         is_complete=gate1_ready,
         missing=missing,
         has_holerite=has_holerite,
+        has_folha_pagamento=has_folha,
         has_extrato_bancario=has_extrato,
         types=types,
     )
