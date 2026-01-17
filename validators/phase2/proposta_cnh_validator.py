@@ -1,16 +1,17 @@
+
 from __future__ import annotations
 
 import re
 import unicodedata
-from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
 
 
 # ======================================================================================
 # Normalizers
 # ======================================================================================
 
-_RE_CPF = re.compile(r"\d+")
+_RE_DIGITS = re.compile(r"\d+")
 
 
 def _only_digits(v: Optional[str]) -> Optional[str]:
@@ -19,7 +20,7 @@ def _only_digits(v: Optional[str]) -> Optional[str]:
     s = str(v).strip()
     if not s:
         return None
-    digits = "".join(_RE_CPF.findall(s))
+    digits = "".join(_RE_DIGITS.findall(s))
     return digits or None
 
 
@@ -34,17 +35,15 @@ def _normalize_name(v: Optional[str]) -> Optional[str]:
     s = str(v).strip()
     if not s:
         return None
-    s = _remove_accents(s)
-    s = s.upper()
-    # colapsa espaços e remove caracteres muito estranhos
+    s = _remove_accents(s).upper()
     s = re.sub(r"\s+", " ", s).strip()
     return s or None
 
 
 def _normalize_date(v: Optional[str]) -> Optional[str]:
     """
-    Normaliza para 'DD/MM/YYYY' quando possível.
-    Aceita entradas comuns:
+    Normalize to 'DD/MM/YYYY' when possible.
+    Accepts:
       - '12/07/1987'
       - '1987-07-12'
       - '1987/07/12'
@@ -56,19 +55,19 @@ def _normalize_date(v: Optional[str]) -> Optional[str]:
     if not s:
         return None
 
-    # YYYY-MM-DD ou YYYY/MM/DD
+    # YYYY-MM-DD or YYYY/MM/DD
     m = re.fullmatch(r"(\d{4})[-/](\d{2})[-/](\d{2})", s)
     if m:
         yyyy, mm, dd = m.group(1), m.group(2), m.group(3)
         return f"{dd}/{mm}/{yyyy}"
 
-    # DD/MM/YYYY ou DD-MM-YYYY
+    # DD/MM/YYYY or DD-MM-YYYY
     m = re.fullmatch(r"(\d{2})[-/](\d{2})[-/](\d{4})", s)
     if m:
         dd, mm, yyyy = m.group(1), m.group(2), m.group(3)
         return f"{dd}/{mm}/{yyyy}"
 
-    # tentativa final: parse flexível via datetime (sem depender de dateutil)
+    # last resort parsing
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
         try:
             dt = datetime.strptime(s, fmt)
@@ -88,9 +87,12 @@ def _normalize_value(field: str, v: Optional[Any]) -> Optional[str]:
         return _normalize_name(str(v))
     if field == "data_nascimento":
         return _normalize_date(str(v))
-    # fallback
     s = str(v).strip()
     return s or None
+
+
+def _now_utc_iso_z() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 # ======================================================================================
@@ -134,18 +136,13 @@ def _get_cnh_value(field: str, cnh_data: Optional[Dict[str, Any]]) -> Optional[A
 # Report builder
 # ======================================================================================
 
-def _build_item(
-    field: str,
-    proposta_raw: Optional[Any],
-    cnh_raw: Optional[Any],
-) -> Dict[str, Any]:
+def _build_item(field: str, proposta_raw: Optional[Any], cnh_raw: Optional[Any]) -> Dict[str, Any]:
     proposta_norm = _normalize_value(field, proposta_raw)
     cnh_norm = _normalize_value(field, cnh_raw)
 
     proposta_obj = {"raw": proposta_raw, "normalized": proposta_norm}
     cnh_obj = {"raw": cnh_raw, "normalized": cnh_norm}
 
-    # status logic
     if proposta_norm is None and cnh_norm is None:
         status = "not_comparable"
         explain = "Campo ausente ou não normalizável em ambos os documentos; comparação não aplicável."
@@ -209,11 +206,10 @@ def build_proposta_cnh_report(
         "not_comparable": len(sections["not_comparable"]),
     }
 
-    report: Dict[str, Any] = {
+    return {
         "case_id": case_id,
         "validator": "proposta_vs_cnh",
-        "created_at": datetime.utcnow().isoformat() + "Z",
+        "created_at": _now_utc_iso_z(),
         "summary": summary,
         "sections": sections,
     }
-    return report
