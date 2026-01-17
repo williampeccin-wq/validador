@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from validators.phase2.status_contracts import compute_overall_status
+
 
 # -----------------------------
 # Tipos
@@ -132,24 +134,41 @@ def _parse_money(s: Any) -> Optional[float]:
 
 def _overall_from_checks(checks: List[CheckResult]) -> MasterSummary:
     """
-    Severidade:
-      FAIL > WARN > MISSING > OK
+    Contrato Phase 2: status agregado derivado dos checks.
+
+    Enum permitido: OK | WARN | FAIL | MISSING
+    Precedência (pior vence): FAIL > MISSING > WARN > OK
+
+    Observações:
+    - Mantemos counts para inspeção.
+    - Se houver status fora do enum, degradamos para WARN (sem quebrar execução).
     """
     counts: Dict[str, int] = {"OK": 0, "WARN": 0, "FAIL": 0, "MISSING": 0}
-    for c in checks:
-        s = (c.status or "").upper()
-        if s not in counts:
-            counts[s] = 0
-        counts[s] += 1
 
-    if counts.get("FAIL", 0) > 0:
-        overall = "FAIL"
-    elif counts.get("WARN", 0) > 0:
-        overall = "WARN"
-    elif counts.get("MISSING", 0) > 0:
+    allowed = set(counts.keys())
+    statuses: List[str] = []
+
+    for c in checks:
+        s = (c.status or "").strip().upper()
+        if not s:
+            s = "MISSING"
+        if s not in allowed:
+            # Robustez: não explodir em runtime por status legado.
+            # Contrato formal é fechado, mas este fallback evita quebrar execução.
+            s = "WARN"
+        counts[s] = counts.get(s, 0) + 1
+        statuses.append(s)
+
+    # Contrato: lista vazia => MISSING
+    if not statuses:
         overall = "MISSING"
     else:
-        overall = "OK"
+        try:
+            overall = compute_overall_status(statuses)
+        except Exception:
+            # Fallback defensivo: se algo inesperado ocorrer, escolhe o pior conhecido.
+            rank = {"OK": 0, "WARN": 1, "MISSING": 2, "FAIL": 3}
+            overall = max(statuses, key=lambda st: rank.get(st, 1))
 
     return MasterSummary(overall_status=overall, counts=counts)
 
@@ -698,16 +717,29 @@ def save_phase2_report(report: MasterReport, phase2_root: str = "storage/phase2"
 
     payload = asdict(report)
 
+
     # Compatibilidade: consumidores/testes esperam um status agregado no topo.
     # (o report já possui summary.overall_status, mas aqui normalizamos também em root)
-    overall = None
-    try:
-        overall = report.summary.overall_status
-    except Exception:
-        overall = None
+    overall: str
 
-    if not isinstance(overall, str) or not overall:
-        overall = "OK"
+    # Preferimos o summary, mas garantimos que o valor reflita o contrato.
+    overall = ""
+    try:
+        overall = str(getattr(report.summary, "overall_status", "") or "").strip().upper()
+    except Exception:
+        overall = ""
+
+    if not overall:
+        overall = "MISSING"
+
+    # Se por algum motivo o summary não estiver alinhado, recomputa a partir dos checks.
+    # Contrato: FAIL > MISSING > WARN > OK; vazio => MISSING.
+    try:
+        recomputed = compute_overall_status([c.status for c in report.checks])
+        overall = recomputed
+    except Exception:
+        # fallback: mantém o summary normalizado.
+        pass
 
     payload["overall_status"] = overall
     payload["status"] = overall
