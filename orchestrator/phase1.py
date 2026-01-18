@@ -135,8 +135,8 @@ def _extract_text_phase1(file_path: str, raw: "RawPayload") -> Tuple[str, Dict[s
                 filename=raw.filename,
                 tesseract_cmd=ocr_cfg["tesseract_cmd"],
                 poppler_path=ocr_cfg["poppler_path"],
-                min_text_len_threshold=int(ocr_cfg["min_text_len_threshold"]),
-                ocr_dpi=int(ocr_cfg["ocr_dpi"]),
+                min_text_len_threshold=int(os.getenv("PHASE1_MIN_TEXT_LEN_THRESHOLD", "800")),
+                ocr_dpi=int(os.getenv("PHASE1_OCR_DPI", "350")),
             )
             return (text or ""), {"extractor": {"mode": "image_ocr"}, "ocr": dbg}
         except Exception as e:
