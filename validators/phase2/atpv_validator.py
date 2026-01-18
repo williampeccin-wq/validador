@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Reusa DV públicos já existentes no validador "duro" de ATPV.
 # Nota: Não chamamos validate_atpv() porque ele:
-#  - exige RENAVAM como obrigatório (decisão aqui é condicional)
+#  - exige RENAVAM como obrigatório (decisão aqui é condicional/gradual)
 #  - valida vendedor como "nome humano" (decisão aqui é informativo; pode ser PJ)
 from validators.atpv import _is_valid_cpf as _is_valid_cpf  # type: ignore
 from validators.atpv import _is_valid_cnpj as _is_valid_cnpj  # type: ignore
@@ -156,14 +156,37 @@ def _worst_status(a: str, b: str) -> str:
     return aa if _STATUS_RANK[aa] < _STATUS_RANK[bb] else bb
 
 
+def _vehicle_correlates_present(presence: Dict[str, Dict[str, Any]]) -> bool:
+    """
+    "Casos suportados" para exigir RENAVAM: quando há documento correlato de veículo no Phase1.
+    Mantemos lista conservadora (não assume nomes futuros).
+    """
+    for doc_type in (
+        "documento_veiculo",
+        "documento_veiculo_novo",
+        "documento_veiculo_antigo",
+        "crlv_e",
+        "crlv",
+        "crv",
+    ):
+        meta = presence.get(doc_type) or {}
+        if bool(meta.get("present")):
+            return True
+    return False
+
+
 def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Phase 2 ATPV checks.
 
-    Locked decisions for this iteration:
-      - RENAVAM condicional (não degrada por ausência; degrada por presente inválido)
-      - Vendedor informativo (sem validação "nome humano"; pode ser PJ)
-      - Alertas de revisit (RENAVAM/vendedor) via checks OK (visível e determinístico, sem degradar overall_status)
+    Locked decisions (como no seu estado estável descrito):
+      - RENAVAM condicional por padrão (não degrada por ausência; degrada por presente inválido)
+      - Vendedor informativo (pode ser PJ)
+      - Followups via checks OK (visíveis, determinísticos, sem degradar overall_status)
+
+    Evolução nesta branch:
+      - adiciona check "vehicle.atpv.renavam.required_if_supported" que prepara caminho para tornar
+        RENAVAM obrigatório quando houver docs correlatos de veículo (caso suportado).
     """
     atpv_meta = presence.get("atpv") or {}
     if not bool(atpv_meta.get("present")):
@@ -281,8 +304,10 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
                 )
             )
 
-    # RENAVAM condicional
+    # RENAVAM condicional (política atual)
     ren_raw = atpv.get("renavam")
+    ren11 = _normalize_renavam_to_11(str(ren_raw)) if ren_raw not in (None, "") else ""
+
     if ren_raw in (None, ""):
         checks.append(
             _mk_check(
@@ -293,7 +318,6 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
             )
         )
     else:
-        ren11 = _normalize_renavam_to_11(str(ren_raw))
         if not ren11:
             checks.append(
                 _mk_check(
@@ -323,7 +347,28 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
                     )
                 )
 
-    # Crosscheck comprador ↔ proposta
+    # RENAVAM obrigatório quando suportado (novo "caminho" para obrigatoriedade)
+    supported = _vehicle_correlates_present(presence)
+    if supported:
+        if ren11 and _is_valid_renavam_11(ren11):
+            checks.append(
+                _mk_check(
+                    check_id="vehicle.atpv.renavam.required_if_supported",
+                    status="OK",
+                    message="RENAVAM presente no ATPV (caso suportado por documento correlato de veículo).",
+                )
+            )
+        else:
+            checks.append(
+                _mk_check(
+                    check_id="vehicle.atpv.renavam.required_if_supported",
+                    status="MISSING",
+                    message="RENAVAM ausente (ou inválido) no ATPV, mas obrigatório quando há documento correlato de veículo.",
+                    evidence={"supported": True, "renavam_present": bool(ren_raw not in (None, ""))},
+                )
+            )
+
+    # Crosscheck comprador ↔ proposta (Política A)
     proposta, proposta_err = _read_phase1_latest_data(phase1_case_root, "proposta_daycoval")
     if proposta_err:
         checks.append(
@@ -336,74 +381,72 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
         )
     else:
         proposta = proposta or {}
-        proposta_doc_raw = _pick_first(proposta, ["cpf", "cpf_financiado", "cpf_cliente", "cpf_titular", "cpf_cnpj", "documento", "documento_numero"])
-        proposta_nome_raw = _pick_first(proposta, ["nome_financiado", "nome", "nome_cliente", "cliente_nome", "nome_titular"])
+        proposta_doc_raw = _pick_first(
+            proposta,
+            ["cpf", "cpf_financiado", "cpf_cliente", "cpf_titular", "cpf_cnpj", "documento", "documento_numero"],
+        )
+        proposta_nome_raw = _pick_first(
+            proposta,
+            ["nome_financiado", "nome", "nome_cliente", "cliente_nome", "nome_titular"],
+        )
 
         proposta_doc = _only_digits(str(proposta_doc_raw or ""))
         proposta_nome = _sanitize_str(proposta_nome_raw or "")
 
         comprador_nome = _sanitize_str(atpv.get("comprador_nome") or "")
 
-        status = "OK"
-        msg_parts: List[str] = []
-
-        # doc
+        # Regra correta do contrato (conforme teste):
+        # - Se ambos docs existem: doc mismatch => WARN (não "salva" com nome)
+        # - Se algum doc faltando: pode tentar match por nome
         if comprador_doc and proposta_doc:
             if comprador_doc == proposta_doc:
-                msg_parts.append("CPF/CNPJ comprador confere com proposta.")
+                checks.append(
+                    _mk_check(
+                        check_id="vehicle.atpv.comprador.matches_proposta",
+                        status="OK",
+                        message="Comprador do ATPV coincide com o documento do comprador na proposta.",
+                        evidence={"atpv": _mask_doc(comprador_doc), "proposta": _mask_doc(proposta_doc)},
+                    )
+                )
             else:
-                status = _worst_status(status, "WARN")
-                msg_parts.append("CPF/CNPJ comprador diverge da proposta.")
+                checks.append(
+                    _mk_check(
+                        check_id="vehicle.atpv.comprador.matches_proposta",
+                        status="WARN",
+                        message="Comprador do ATPV NÃO coincide com o documento do comprador na proposta (Política A).",
+                        evidence={"atpv": _mask_doc(comprador_doc), "proposta": _mask_doc(proposta_doc)},
+                    )
+                )
         else:
-            status = _worst_status(status, "WARN")
-            msg_parts.append("CPF/CNPJ insuficiente para comparar comprador vs proposta.")
-
-        # nome
-        if comprador_nome and proposta_nome:
-            if _name_matches(comprador_nome, proposta_nome):
-                msg_parts.append("Nome comprador compatível com proposta.")
+            # docs insuficientes -> fallback por nome
+            if comprador_nome and proposta_nome and _name_matches(comprador_nome, proposta_nome):
+                checks.append(
+                    _mk_check(
+                        check_id="vehicle.atpv.comprador.matches_proposta",
+                        status="OK",
+                        message="Comprador do ATPV coincide com o comprador da proposta (match por nome; docs ausentes/incompletos).",
+                    )
+                )
             else:
-                status = _worst_status(status, "WARN")
-                msg_parts.append("Nome comprador diverge da proposta.")
-        else:
-            status = _worst_status(status, "WARN")
-            msg_parts.append("Nome insuficiente para comparar comprador vs proposta.")
+                checks.append(
+                    _mk_check(
+                        check_id="vehicle.atpv.comprador.matches_proposta",
+                        status="WARN",
+                        message="Comprador do ATPV NÃO coincide com a proposta (docs ausentes/incompletos e nome não confirmou).",
+                        evidence={"atpv_doc": _mask_doc(comprador_doc), "proposta_doc": _mask_doc(proposta_doc)},
+                    )
+                )
 
-        checks.append(
-            _mk_check(
-                check_id="vehicle.atpv.comprador.matches_proposta",
-                status=status,
-                message=" ".join(msg_parts),
-                evidence={
-                    "comprador_doc": _mask_doc(comprador_doc),
-                    "proposta_doc": _mask_doc(proposta_doc),
-                    "comprador_nome_norm": _normalize_name(comprador_nome)[:40] if comprador_nome else "",
-                    "proposta_nome_norm": _normalize_name(proposta_nome)[:40] if proposta_nome else "",
-                },
-            )
+    # Vendedor informativo
+    vendor_name = _sanitize_str(atpv.get("vendedor_nome") or "")
+    checks.append(
+        _mk_check(
+            check_id="vehicle.atpv.vendedor.informativo",
+            status="OK",
+            message="Vendedor do ATPV tratado como informativo (pode ser PJ).",
+            evidence={"vendedor_nome": vendor_name[:60] if vendor_name else ""},
         )
-
-    # Vendedor informativo (sem validação vinculante nesta fase)
-    vend_nome = _sanitize_str(atpv.get("vendedor_nome") or "")
-    vend_doc = _only_digits(str(atpv.get("vendedor_cpf_cnpj") or ""))
-    if vend_nome or vend_doc:
-        checks.append(
-            _mk_check(
-                check_id="vehicle.atpv.vendedor.informativo",
-                status="OK",
-                message="Vendedor registrado como informativo (regra não vinculante nesta fase).",
-                evidence={"vendedor_doc": _mask_doc(vend_doc), "vendedor_nome_norm": _normalize_name(vend_nome)[:60] if vend_nome else ""},
-            )
-        )
-    else:
-        checks.append(
-            _mk_check(
-                check_id="vehicle.atpv.vendedor.informativo",
-                status="OK",
-                message="Vendedor não disponível; regra informativa (sem impacto nesta fase).",
-                evidence={"vendedor_disponivel": False},
-            )
-        )
+    )
 
     # Followups (visíveis, determinísticos e NÃO degradam overall_status)
     checks.extend(_followup_checks())
