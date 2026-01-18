@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from validators.phase2.proposta_cnh_senatran_validator import build_proposta_cnh_senatran_checks
 from validators.phase2.atpv_validator import build_atpv_checks
+from validators.phase2.detran_validator import build_detran_checks
 
 # MUST match tests/test_phase2_master_report_meta_contract.py::SCHEMA_VERSION
 SCHEMA_VERSION = "phase2.master_report@1"
@@ -463,6 +464,9 @@ def build_master_report(case_id: str, *, phase1_root: Union[str, Path], phase2_r
 
     # NEW (non-regression): only when ATPV exists (validator itself returns [] if not present)
     checks.extend(build_atpv_checks(phase1_case_root=phase1_case_root, presence=presence))
+
+    # NEW (non-regression): only when DETRAN exists (validator itself returns [] if not present)
+    checks.extend(build_detran_checks(phase1_case_root=phase1_case_root, presence=presence))
 
     _ensure_unique_check_ids(checks)
 
