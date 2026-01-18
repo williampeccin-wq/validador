@@ -12,21 +12,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple, Callable, Union
+from typing import Any, Dict, Optional, List, Tuple, Callable
 
 
 # ======================================================================================
 # Phase 1 text extraction (NON-BLOCKING)
 #
-# Objetivo (Opção A): estabilizar a captura.
+# Objetivo: estabilizar a captura.
 # - Sempre persistir o bruto.
 # - Tentar extrair texto e parsear quando possível.
 # - Em qualquer falha de extração/parse, registrar debug e seguir.
 #
-# Nota importante (portabilidade): em ambientes sem Poppler/Tesseract
-# (ex.: CI), OCR pode não estar disponível. Por padrão, a Fase 1 não
-# força OCR; ela usa texto nativo de PDF quando disponível.
-# OCR pode ser habilitado via PHASE1_ENABLE_OCR=1.
+# Nota importante (portabilidade): em ambientes sem Poppler/Tesseract (ex.: CI),
+# OCR pode não estar disponível. Por padrão, a Fase 1 não força OCR; ela usa texto
+# nativo de PDF quando disponível. OCR pode ser habilitado via PHASE1_ENABLE_OCR=1.
+#
+# EXCEÇÃO (decisão A): CNH_SENATRAN força OCR em Phase 1 (sempre), pois é documento
+# imutável/layout fixo e o texto nativo pode ser insuficiente.
 # ======================================================================================
 
 
@@ -89,22 +91,32 @@ def _extract_text_native_pdf(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
         return "", dbg
 
 
-def _extract_text_phase1(file_path: str, raw: "RawPayload") -> Tuple[str, Dict[str, Any]]:
+def _extract_text_phase1(
+    file_path: str,
+    raw: "RawPayload",
+    *,
+    force_ocr: bool = False,
+) -> Tuple[str, Dict[str, Any]]:
     """
     Extrai texto de forma não-bloqueante.
 
-    Regra: por padrão, usa somente texto nativo de PDF.
-    OCR só roda se PHASE1_ENABLE_OCR=1.
+    Regra:
+      - Por padrão, usa somente texto nativo de PDF.
+      - OCR só roda se PHASE1_ENABLE_OCR=1.
+      - Se force_ocr=True: OCR roda mesmo que PHASE1_ENABLE_OCR=0.
     """
-    enable_ocr = _env_truthy("PHASE1_ENABLE_OCR", default="0")
+    enable_ocr = _env_truthy("PHASE1_ENABLE_OCR", default="0") or bool(force_ocr)
 
     # PDF: texto nativo primeiro (portável)
     if (raw.mime_type or "").lower() == "application/pdf" or raw.filename.lower().endswith(".pdf"):
         native_text, dbg_native = _extract_text_native_pdf(base64.b64decode(raw.content_b64))
-        if native_text or not enable_ocr:
+        if native_text and not force_ocr:
             return native_text, {"extractor": dbg_native, "ocr": None}
 
-        # OCR opcional
+        if not enable_ocr:
+            return native_text, {"extractor": dbg_native, "ocr": None}
+
+        # OCR (habilitado ou forçado)
         ocr_cfg = _default_ocr_config()
         try:
             from core.ocr import extract_text_any
@@ -117,14 +129,15 @@ def _extract_text_phase1(file_path: str, raw: "RawPayload") -> Tuple[str, Dict[s
                 min_text_len_threshold=int(ocr_cfg["min_text_len_threshold"]),
                 ocr_dpi=int(ocr_cfg["ocr_dpi"]),
             )
-            return (text or ""), {"extractor": dbg_native, "ocr": dbg}
+            return (text or ""), {"extractor": dbg_native, "ocr": dbg, "force_ocr": bool(force_ocr)}
         except Exception as e:
             return native_text, {
                 "extractor": dbg_native,
-                "ocr": {"error": f"{type(e).__name__}: {e}", "enabled": True},
+                "ocr": {"error": f"{type(e).__name__}: {e}", "enabled": True, "forced": bool(force_ocr)},
+                "force_ocr": bool(force_ocr),
             }
 
-    # Imagem: OCR somente se habilitado
+    # Imagem: OCR somente se habilitado/forçado
     if enable_ocr:
         ocr_cfg = _default_ocr_config()
         try:
@@ -138,11 +151,11 @@ def _extract_text_phase1(file_path: str, raw: "RawPayload") -> Tuple[str, Dict[s
                 min_text_len_threshold=int(ocr_cfg["min_text_len_threshold"]),
                 ocr_dpi=int(ocr_cfg["ocr_dpi"]),
             )
-            return (text or ""), {"extractor": {"mode": "image_ocr"}, "ocr": dbg}
+            return (text or ""), {"extractor": {"mode": "image_ocr"}, "ocr": dbg, "force_ocr": bool(force_ocr)}
         except Exception as e:
-            return "", {"extractor": {"mode": "image_ocr"}, "ocr": {"error": f"{type(e).__name__}: {e}"}}
+            return "", {"extractor": {"mode": "image_ocr"}, "ocr": {"error": f"{type(e).__name__}: {e}"}, "force_ocr": bool(force_ocr)}
 
-    return "", {"extractor": {"mode": "none", "reason": "ocr_disabled"}, "ocr": None}
+    return "", {"extractor": {"mode": "none", "reason": "ocr_disabled"}, "ocr": None, "force_ocr": bool(force_ocr)}
 
 
 # ======================================================================================
@@ -154,7 +167,7 @@ class DocumentType(str, Enum):
     PROPOSTA_DAYCOVAL = "proposta_daycoval"
     CNH = "cnh"
 
-    # CNH SENATRAN (layout fixo, documento imutável)
+    # CNH SENATRAN (layout fixo / documento imutável)
     CNH_SENATRAN = "cnh_senatran"
 
     # Opcionais na Fase 1 (não alteram Gate 1)
@@ -379,6 +392,9 @@ def collect_document(
     - Por padrão, NÃO fazemos parsing dos docs opcionais (holerite/folha/extrato) na Fase 1,
       para evitar travamentos e porque as inferências/validações rodam depois.
     - Se você quiser forçar parsing dos opcionais: export PHASE1_PARSE_OPTIONAL_DOCS=1
+
+    Exceção (decisão A):
+    - CNH_SENATRAN força OCR na extração de texto para parsing em Phase 1.
     """
     if storage_root is not None:
         _set_storage_root(storage_root)
@@ -404,7 +420,11 @@ def collect_document(
         if parser is not None:
             # 1) extrair texto (não-bloqueante)
             try:
-                raw_text, extractor_debug = _extract_text_phase1(file_path, raw)
+                raw_text, extractor_debug = _extract_text_phase1(
+                    file_path,
+                    raw,
+                    force_ocr=(dt == DocumentType.CNH_SENATRAN),
+                )
             except Exception as e:
                 raw_text = ""
                 extractor_debug = {"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
