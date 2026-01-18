@@ -9,7 +9,7 @@ from validators.atpv import _is_valid_cnpj as _is_valid_cnpj  # type: ignore
 from validators.atpv import _is_valid_cpf as _is_valid_cpf  # type: ignore
 from validators.atpv import _is_valid_renavam_11 as _is_valid_renavam_11  # type: ignore
 from validators.atpv import _normalize_renavam_to_11 as _normalize_renavam_to_11  # type: ignore
-from validators.phase2.utils import load_latest_phase1_json
+from validators.phase2.utils import load_latest_phase1_json, normalize_doc_id
 
 
 def _only_digits(s: str) -> str:
@@ -98,10 +98,7 @@ def _vehicle_correlates_present(presence: Dict[str, Dict[str, Any]]) -> Optional
 def _extract_vehicle_owner_doc(vehicle_data: Dict[str, Any]) -> str:
     """Extrai (best-effort) o documento do proprietário a partir do payload do doc de veículo.
 
-    Chaves suportadas (conforme parsers do projeto):
-      - crlv_e: proprietario_doc
-      - documento_veiculo_*: pode variar ("proprietario_doc", "cpf_proprietario", "cpf")
-      - outros: heurística por dicionários internos
+    Agora aplica normalize_doc_id (remove máscara + exige 11/14 dígitos).
     """
     if not isinstance(vehicle_data, dict):
         return ""
@@ -116,11 +113,10 @@ def _extract_vehicle_owner_doc(vehicle_data: Dict[str, Any]) -> str:
     ]
 
     for v in candidates:
-        d = _only_digits(str(v or ""))
-        if len(d) in (11, 14):
+        d = normalize_doc_id(v)
+        if d:
             return d
 
-    # Alguns parsers guardam proprietário como string (sem doc) — nada a fazer.
     return ""
 
 
@@ -177,8 +173,10 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
             )
         )
 
+    # NORMALIZACAO: comprador_doc (CPF/CNPJ) sempre em formato dígitos (11/14) para comparar e validar
     comprador_doc_raw = atpv.get("comprador_cpf_cnpj")
-    comprador_doc = _only_digits(str(comprador_doc_raw or ""))
+    comprador_doc = normalize_doc_id(comprador_doc_raw)
+
     if comprador_doc:
         dv_ok = False
         if len(comprador_doc) == 11:
@@ -268,7 +266,9 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
             ["nome_financiado", "nome", "nome_cliente", "cliente_nome", "nome_titular"],
         )
 
-        proposta_doc = _only_digits(str(proposta_doc_raw or ""))
+        # NORMALIZACAO: proposta_doc para comparação robusta
+        proposta_doc = normalize_doc_id(proposta_doc_raw)
+
         proposta_nome = _sanitize_str(proposta_nome_raw or "")
         comprador_nome = _sanitize_str(atpv.get("comprador_nome") or "")
 
@@ -425,8 +425,10 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
     # ----------------------------
     # ENDURECIMENTO (C): vendedor vinculante condicional (WARN por enquanto)
     # ----------------------------
+    # NORMALIZACAO: vendedor_doc comparável independente de máscara
     vendor_doc_raw = atpv.get("vendedor_cpf_cnpj")
-    vendor_doc = _only_digits(str(vendor_doc_raw or ""))
+    vendor_doc = normalize_doc_id(vendor_doc_raw)
+
     vendor_doc_valid = bool(
         (len(vendor_doc) == 11 and _is_valid_cpf(vendor_doc))
         or (len(vendor_doc) == 14 and _is_valid_cnpj(vendor_doc))
