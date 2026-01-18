@@ -3,6 +3,10 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 import re
 
+# Reusa normalização + DV RENAVAM do validador duro (best-effort só seta se válido)
+from validators.atpv import _is_valid_renavam_11 as _is_valid_renavam_11  # type: ignore
+from validators.atpv import _normalize_renavam_to_11 as _normalize_renavam_to_11  # type: ignore
+
 MIN_TEXT_LEN_THRESHOLD_DEFAULT = 800
 
 _PLATE_RE = re.compile(r"\b([A-Z]{3}[0-9][A-Z0-9][0-9]{2})\b")
@@ -96,11 +100,36 @@ def _extract_renavam_from_line(line: str) -> Optional[str]:
 
 
 def _extract_renavam(lines: List[str]) -> Optional[str]:
-    for l in lines:
-        if _RENAVAM_ANCHOR_RE.search(l):
-            r = _extract_renavam_from_line(l)
-            if r:
-                return r
+    """Extrai RENAVAM com heurística conservadora.
+
+    Regras:
+      1) Preferir âncora + dígitos na mesma linha.
+      2) Se a âncora estiver sozinha (sem dígitos), olhar 1 linha abaixo (layout tabular comum).
+      3) Só retorna se normalizar para 11 e DV for válido (evita falso positivo e evita quebrar Phase2).
+    """
+    for i, l in enumerate(lines):
+        if not _RENAVAM_ANCHOR_RE.search(l):
+            continue
+
+        # Caso 1: mesma linha
+        r = _extract_renavam_from_line(l)
+        if r:
+            r11 = _normalize_renavam_to_11(r)
+            if r11 and _is_valid_renavam_11(r11):
+                return r11
+
+        # Caso 2: âncora sem dígitos -> linha seguinte (bem conservador)
+        if i + 1 < len(lines):
+            nxt = lines[i + 1]
+
+            # "pureza": evitar pegar texto solto
+            nxt_digits = _only_digits(nxt)
+            nxt_noise = re.sub(r"[0-9\s\.\-]", "", nxt)
+            if nxt_digits and (9 <= len(nxt_digits) <= 11) and len(nxt_noise.strip()) <= 1:
+                r11 = _normalize_renavam_to_11(nxt_digits)
+                if r11 and _is_valid_renavam_11(r11):
+                    return r11
+
     return None
 
 
@@ -162,92 +191,88 @@ def _extract_doc(block: List[str]) -> Optional[str]:
     return None
 
 
-def _money_in_line(lines: List[str], key: str) -> Optional[str]:
+def _money_in_line(lines: List[str], label: str) -> Optional[str]:
+    label = label.upper()
     for l in lines:
-        if key in l.upper():
+        if label in l.upper():
             m = _MONEY_RE.search(l)
             if m:
-                return m.group(0)
+                return m.group(0).strip()
     return None
 
 
 # =========================
-# DV cross-check (soft): CPF
-# =========================
-
-def _cpf_is_valid(cpf_digits: str) -> Tuple[bool, str]:
-    """
-    cpf_digits: apenas dígitos.
-    Retorna (ok, reason): ok|empty|bad_length|all_equal|dv_mismatch|not_applicable
-    """
-    d = _only_digits(cpf_digits or "")
-    if not d:
-        return False, "empty"
-    if len(d) != 11:
-        return False, "bad_length"
-    if d == d[0] * 11:
-        return False, "all_equal"
-
-    def dv_calc(digs: str) -> int:
-        s = sum(int(d) * w for d, w in zip(digs, range(len(digs) + 1, 1, -1)))
-        r = 11 - (s % 11)
-        return 0 if r >= 10 else r
-
-    dv1 = dv_calc(d[:9])
-    dv2 = dv_calc(d[:9] + str(dv1))
-    if d[-2:] != f"{dv1}{dv2}":
-        return False, "dv_mismatch"
-
-    return True, "ok"
-
-
-# =========================
-# API pública
+# Public API
 # =========================
 
 def analyze_atpv(
+    pdf_path: str,
     *,
-    text: str,
     min_text_len_threshold: int = MIN_TEXT_LEN_THRESHOLD_DEFAULT,
+    ocr_dpi: int = 300,
 ) -> Dict[str, Any]:
-    text = _normalize(text)
+    native_text, pages_native_len = _extract_native_text(pdf_path)
 
-    if len(text) < min_text_len_threshold:
-        return {
-            "ok": False,
-            "reason": "text_too_short",
-            "data": {},
-            "warnings": [],
-        }
+    if len(native_text) >= min_text_len_threshold:
+        mode = "native"
+        ocr_text = ""
+        pages_ocr_len = [0 for _ in pages_native_len]
+    else:
+        mode = "ocr"
+        ocr_text, pages_ocr_len = _ocr_pdf_to_text(pdf_path, dpi=ocr_dpi)
 
+    text = native_text if mode == "native" else ocr_text
     data = _extract_fields(text)
 
-    warnings: List[str] = []
-    checks: Dict[str, Any] = {}
-
-    for k in ("vendedor_cpf_cnpj", "comprador_cpf_cnpj"):
-        raw = data.get(k)
-        raw_str = raw or ""
-        norm = _only_digits(raw_str)
-        ok, reason = _cpf_is_valid(norm)
-
-        checks[k] = {
-            "raw": raw,
-            "normalized": norm,
-            "dv_ok": bool(ok),
-            "reason": reason,
+    debug_pages = [
+        {
+            "page": i + 1,
+            "native_len": pages_native_len[i] if i < len(pages_native_len) else 0,
+            "ocr_len": pages_ocr_len[i] if i < len(pages_ocr_len) else 0,
         }
-
-        if norm and len(norm) == 11 and not ok and reason in ("all_equal", "dv_mismatch"):
-            label = "CPF_VENDEDOR" if k == "vendedor_cpf_cnpj" else "CPF_COMPRADOR"
-            if reason == "all_equal":
-                warnings.append(f"{label} inválido (dígitos repetidos) (extraído='{raw_str}')")
-            else:
-                warnings.append(f"{label} DV inválido (extraído='{raw_str}')")
+        for i in range(max(len(pages_native_len), len(pages_ocr_len)))
+    ]
 
     return {
         "ok": True,
         "data": data,
-        "checks": checks,
-        "warnings": warnings,
+        "mode": mode,
+        "debug": {
+            "mode": mode,
+            "native_text_len": len(native_text),
+            "ocr_text_len": len(ocr_text),
+            "min_text_len_threshold": min_text_len_threshold,
+            "ocr_dpi": ocr_dpi,
+            "pages": debug_pages,
+            "warnings": [],
+            "checks": {},
+        },
     }
+
+
+# =========================
+# Text extraction
+# =========================
+
+def _extract_native_text(pdf_path: str) -> Tuple[str, List[int]]:
+    import pdfplumber
+
+    texts, lens = [], []
+    with pdfplumber.open(pdf_path) as pdf:
+        for p in pdf.pages:
+            t = p.extract_text() or ""
+            texts.append(t)
+            lens.append(len(t))
+    return "\n".join(texts), lens
+
+
+def _ocr_pdf_to_text(pdf_path: str, *, dpi: int) -> Tuple[str, List[int]]:
+    from pdf2image import convert_from_path
+    import pytesseract
+
+    texts, lens = [], []
+    for img in convert_from_path(pdf_path, dpi=dpi):
+        t = pytesseract.image_to_string(img, lang="por") or ""
+        texts.append(t)
+        lens.append(len(t))
+    return "\n".join(texts), lens

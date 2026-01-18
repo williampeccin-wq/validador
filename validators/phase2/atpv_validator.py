@@ -1,157 +1,127 @@
 # validators/phase2/atpv_validator.py
 from __future__ import annotations
 
-import json
-import re
-import unicodedata
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Reusa DV e normalização RENAVAM do validador "duro" existente.
-from validators.atpv import _is_valid_cpf as _is_valid_cpf  # type: ignore
 from validators.atpv import _is_valid_cnpj as _is_valid_cnpj  # type: ignore
+from validators.atpv import _is_valid_cpf as _is_valid_cpf  # type: ignore
 from validators.atpv import _is_valid_renavam_11 as _is_valid_renavam_11  # type: ignore
 from validators.atpv import _normalize_renavam_to_11 as _normalize_renavam_to_11  # type: ignore
-
-
-_PLATE_RE = re.compile(r"^[A-Z]{3}[0-9][A-Z0-9][0-9]{2}$")  # Mercosul/antiga compat
-_VIN_RE = re.compile(r"^[A-HJ-NPR-Z0-9]{17}$")  # VIN 17 chars, exclui I,O,Q
-
-
-def _safe_read_json(p: Path) -> Tuple[Optional[dict], Optional[str]]:
-    try:
-        return json.loads(p.read_text(encoding="utf-8")), None
-    except Exception as e:
-        return None, str(e)
+from validators.phase2.utils import load_latest_phase1_json
 
 
 def _only_digits(s: str) -> str:
+    import re
     return re.sub(r"\D+", "", s or "")
 
 
-def _sanitize_str(s: Any) -> str:
-    return str(s).strip()
+def _sanitize_str(s: str) -> str:
+    return " ".join((s or "").strip().split()).upper()
 
 
-def _mask_doc(doc: Optional[str]) -> str:
-    if not doc:
+def _mask_doc(doc: str) -> str:
+    d = _only_digits(doc)
+    if not d:
         return ""
-    d = _only_digits(str(doc))
-    if len(d) <= 4:
-        return d
     if len(d) == 11:
-        return f"{d[:3]}***{d[-2:]}"
+        return f"{d[:3]}.***.***-{d[-2:]}"
     if len(d) == 14:
-        return f"{d[:4]}***{d[-2:]}"
-    return f"{d[:3]}***{d[-2:]}"
+        return f"{d[:2]}.***.***/****-{d[-2:]}"
+    return f"***{d[-4:]}"
 
 
-def _mask_renavam(ren11: Optional[str]) -> str:
-    if not ren11:
+def _mask_renavam(ren11: str) -> str:
+    d = _only_digits(ren11)
+    if len(d) != 11:
         return ""
-    d = _only_digits(str(ren11))
-    if len(d) < 4:
-        return d
-    return f"{d[:3]}***{d[-2:]}"
+    return f"{d[:3]}*****{d[-3:]}"
 
 
-def _normalize_name(s: str) -> str:
-    s = s.strip().upper()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"[^A-Z ]+", " ", s)
-    s = re.sub(r"\s{2,}", " ", s).strip()
-    return s
+def _pick_first(d: Dict[str, Any], keys: List[str]) -> Any:
+    for k in keys:
+        if k in d and d.get(k) not in (None, ""):
+            return d.get(k)
+    return None
 
 
 def _name_matches(a: str, b: str) -> bool:
-    na = _normalize_name(a)
-    nb = _normalize_name(b)
-    if not na or not nb:
+    a = _sanitize_str(a)
+    b = _sanitize_str(b)
+    if not a or not b:
         return False
-    if na == nb:
+    if a == b:
         return True
-    if len(na) >= 10 and na in nb:
-        return True
-    if len(nb) >= 10 and nb in na:
-        return True
-    return False
+    # match conservador por tokens
+    ta = set(a.split())
+    tb = set(b.split())
+    return len(ta & tb) >= 2
 
 
-def _parse_money_any(v: Any) -> Optional[float]:
-    if v is None:
-        return None
-    if isinstance(v, (int, float)):
-        return float(v)
-
-    s = str(v).strip()
-    if not s:
-        return None
-
-    s = s.replace("R$", "").replace(" ", "")
-
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".")
-    elif "," in s and "." not in s:
-        s = s.replace(",", ".")
-
-    s = re.sub(r"[^0-9.\-]", "", s)
-    if not s or s in ("-", ".", "-."):
-        return None
-
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def _pick_first(data: Dict[str, Any], keys: List[str]) -> Optional[Any]:
-    for k in keys:
-        if k in data and data.get(k) not in (None, ""):
-            return data.get(k)
-    return None
-
-
-def _read_phase1_latest_data(phase1_case_root: Path, doc_type: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    d = phase1_case_root / doc_type
-    if not d.exists() or not d.is_dir():
-        return None, None
-    jsons = sorted(d.glob("*.json"))
-    if not jsons:
-        return None, None
-
-    raw, err = _safe_read_json(jsons[-1])
-    if err or not isinstance(raw, dict):
-        return None, err or "invalid_json"
-    data = raw.get("data")
-    if data is None:
-        return {}, None
-    if not isinstance(data, dict):
-        return None, "data_not_dict"
-    return data, None
+@dataclass
+class CheckResult:
+    id: str
+    status: str
+    message: str
+    evidence: Dict[str, Any]
 
 
 def _mk_check(*, check_id: str, status: str, message: str, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    return {"id": check_id, "status": status, "message": message, "evidence": evidence or {}}
+    return asdict(CheckResult(id=check_id, status=status, message=message, evidence=evidence or {}))
+
+
+def _read_phase1_latest_data(phase1_case_root: Path, doc_type: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        js = load_latest_phase1_json(phase1_case_root, doc_type)
+    except Exception as e:
+        return None, str(e)
+    if not js:
+        return None, None
+    data = js.get("data") if isinstance(js, dict) else None
+    if data is None:
+        return None, None
+    if isinstance(data, dict):
+        return data, None
+    return None, None
 
 
 def _vehicle_correlates_present(presence: Dict[str, Dict[str, Any]]) -> Optional[str]:
-    """
-    Retorna o doc_type correlato de veículo quando presente (caso suportado),
-    ou None quando não há doc correlato.
-    """
-    for doc_type in (
-        "documento_veiculo",
-        "documento_veiculo_novo",
-        "documento_veiculo_antigo",
-        "crlv_e",
-        "crlv",
-        "crv",
-    ):
-        meta = presence.get(doc_type) or {}
+    # Ordem preferencial: crlv_e (tende a ter RENAVAM), depois layouts alternativos
+    for dt in ("crlv_e", "documento_veiculo_novo", "documento_veiculo_antigo", "documento_veiculo"):
+        meta = presence.get(dt) or {}
         if bool(meta.get("present")):
-            return doc_type
+            return dt
     return None
+
+
+def _extract_vehicle_owner_doc(vehicle_data: Dict[str, Any]) -> str:
+    """Extrai (best-effort) o documento do proprietário a partir do payload do doc de veículo.
+
+    Chaves suportadas (conforme parsers do projeto):
+      - crlv_e: proprietario_doc
+      - documento_veiculo_*: pode variar ("proprietario_doc", "cpf_proprietario", "cpf")
+      - outros: heurística por dicionários internos
+    """
+    if not isinstance(vehicle_data, dict):
+        return ""
+
+    candidates = [
+        vehicle_data.get("proprietario_doc"),
+        vehicle_data.get("proprietario_documento"),
+        vehicle_data.get("cpf_proprietario"),
+        vehicle_data.get("cnpj_proprietario"),
+        vehicle_data.get("cpf"),
+        vehicle_data.get("cnpj"),
+    ]
+
+    for v in candidates:
+        d = _only_digits(str(v or ""))
+        if len(d) in (11, 14):
+            return d
+
+    # Alguns parsers guardam proprietário como string (sem doc) — nada a fazer.
+    return ""
 
 
 def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -203,60 +173,10 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
             _mk_check(
                 check_id="vehicle.atpv.parse.required_fields",
                 status="OK",
-                message="ATPV contém campos essenciais (placa, chassi, valor_venda, comprador_doc, comprador_nome).",
+                message="Campos essenciais de ATPV presentes.",
             )
         )
 
-    # Placa
-    placa = _sanitize_str(atpv.get("placa")).upper()
-    placa_norm = re.sub(r"[^A-Z0-9]", "", placa)
-    if placa_norm:
-        if _PLATE_RE.match(placa_norm):
-            checks.append(_mk_check(check_id="vehicle.atpv.placa.format", status="OK", message="Placa com formato válido."))
-        else:
-            checks.append(
-                _mk_check(
-                    check_id="vehicle.atpv.placa.format",
-                    status="WARN",
-                    message="Placa com formato inválido.",
-                    evidence={"placa": placa_norm},
-                )
-            )
-
-    # Chassi/VIN
-    chassi = _sanitize_str(atpv.get("chassi")).upper()
-    chassi_norm = re.sub(r"[^A-Z0-9]", "", chassi)
-    if chassi_norm:
-        if _VIN_RE.match(chassi_norm):
-            checks.append(_mk_check(check_id="vehicle.atpv.chassi.format", status="OK", message="Chassi (VIN) com formato válido."))
-        else:
-            checks.append(
-                _mk_check(
-                    check_id="vehicle.atpv.chassi.format",
-                    status="WARN",
-                    message="Chassi (VIN) com formato inválido.",
-                    evidence={"chassi": chassi_norm},
-                )
-            )
-
-    # Valor venda
-    v = _parse_money_any(atpv.get("valor_venda"))
-    if v is None:
-        checks.append(_mk_check(check_id="vehicle.atpv.valor_venda.positive", status="WARN", message="Valor de venda não pôde ser interpretado."))
-    else:
-        if v > 0:
-            checks.append(_mk_check(check_id="vehicle.atpv.valor_venda.positive", status="OK", message="Valor de venda positivo."))
-        else:
-            checks.append(
-                _mk_check(
-                    check_id="vehicle.atpv.valor_venda.positive",
-                    status="WARN",
-                    message="Valor de venda não é positivo.",
-                    evidence={"valor_venda": v},
-                )
-            )
-
-    # Documento comprador (DV)
     comprador_doc_raw = atpv.get("comprador_cpf_cnpj")
     comprador_doc = _only_digits(str(comprador_doc_raw or ""))
     if comprador_doc:
@@ -404,18 +324,37 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
     )
 
     # ----------------------------
-    # ENDURECIMENTO: RENAVAM obrigatório quando suportado + cross-check
+    # ENDURECIMENTO (A): "supported" = doc correlato com RENAVAM VÁLIDO extraído
     # ----------------------------
     vehicle_doc_type = _vehicle_correlates_present(presence)
+    vehicle_data: Dict[str, Any] = {}
+    vehicle_err: Optional[str] = None
+    vehicle_ren11 = ""
+    vehicle_ren_valid = False
+
     if vehicle_doc_type:
-        # HARD: obrigatório se suportado
+        vehicle_data_raw, vehicle_err = _read_phase1_latest_data(phase1_case_root, vehicle_doc_type)
+        vehicle_data = vehicle_data_raw or {}
+
+        vehicle_ren_raw = vehicle_data.get("renavam")
+        vehicle_ren11 = _normalize_renavam_to_11(str(vehicle_ren_raw)) if vehicle_ren_raw not in (None, "") else ""
+        vehicle_ren_valid = bool(vehicle_ren11 and _is_valid_renavam_11(vehicle_ren11))
+
+    supported = bool(vehicle_doc_type and vehicle_ren_valid)
+
+    # required_if_supported
+    if supported:
         if not ren11_atpv_valid:
             checks.append(
                 _mk_check(
                     check_id="vehicle.atpv.renavam.required_if_supported",
                     status="FAIL",
-                    message="RENAVAM ausente ou inválido no ATPV, obrigatório quando há documento correlato de veículo.",
-                    evidence={"vehicle_doc_type": vehicle_doc_type, "renavam_present": bool(ren_raw not in (None, ""))},
+                    message="RENAVAM ausente ou inválido no ATPV; obrigatório quando doc correlato tem RENAVAM válido.",
+                    evidence={
+                        "vehicle_doc_type": vehicle_doc_type,
+                        "vehicle": _mask_renavam(vehicle_ren11),
+                        "atpv_present": bool(ren_raw not in (None, "")),
+                    },
                 )
             )
         else:
@@ -423,57 +362,114 @@ def build_atpv_checks(*, phase1_case_root: Path, presence: Dict[str, Dict[str, A
                 _mk_check(
                     check_id="vehicle.atpv.renavam.required_if_supported",
                     status="OK",
-                    message="RENAVAM presente e válido no ATPV (caso suportado).",
+                    message="RENAVAM presente e válido no ATPV (caso suportado por doc correlato com RENAVAM válido).",
+                    evidence={"vehicle_doc_type": vehicle_doc_type},
                 )
             )
-
-        # Cross-check apenas se ambos válidos (do contrário: OK não-comparável)
-        vehicle_data, vehicle_err = _read_phase1_latest_data(phase1_case_root, vehicle_doc_type)
+    elif vehicle_doc_type:
+        # Há doc correlato, mas sem RENAVAM válido => não exigir (evita FAIL factory)
+        msg = "Documento correlato presente, mas sem RENAVAM válido extraído; não exigindo RENAVAM do ATPV (ainda)."
         if vehicle_err:
+            msg = "Falha ao ler documento correlato; não exigindo RENAVAM do ATPV (ainda)."
+        checks.append(
+            _mk_check(
+                check_id="vehicle.atpv.renavam.required_if_supported",
+                status="WARN",
+                message=msg,
+                evidence={"vehicle_doc_type": vehicle_doc_type, "vehicle_err": vehicle_err or "", "vehicle_renavam": _mask_renavam(vehicle_ren11)},
+            )
+        )
+    else:
+        checks.append(
+            _mk_check(
+                check_id="vehicle.atpv.renavam.required_if_supported",
+                status="OK",
+                message="Sem documento correlato com RENAVAM válido; RENAVAM do ATPV não exigido.",
+            )
+        )
+
+    # matches_vehicle_doc: só faz sentido se supported e ATPV tem RENAVAM válido
+    if supported and ren11_atpv_valid:
+        if ren11_atpv == vehicle_ren11:
             checks.append(
                 _mk_check(
                     check_id="vehicle.atpv.renavam.matches_vehicle_doc",
-                    status="WARN",
-                    message="Falha ao ler documento correlato de veículo para cross-check de RENAVAM.",
-                    evidence={"vehicle_doc_type": vehicle_doc_type, "error": vehicle_err},
+                    status="OK",
+                    message="RENAVAM do ATPV coincide com o RENAVAM do documento do veículo.",
                 )
             )
         else:
-            vehicle_ren_raw = (vehicle_data or {}).get("renavam")
-            vehicle_ren11 = _normalize_renavam_to_11(str(vehicle_ren_raw)) if vehicle_ren_raw not in (None, "") else ""
-            vehicle_ren_valid = bool(vehicle_ren11 and _is_valid_renavam_11(vehicle_ren11))
-
-            if ren11_atpv_valid and vehicle_ren_valid:
-                if ren11_atpv == vehicle_ren11:
-                    checks.append(
-                        _mk_check(
-                            check_id="vehicle.atpv.renavam.matches_vehicle_doc",
-                            status="OK",
-                            message="RENAVAM do ATPV coincide com o RENAVAM do documento do veículo.",
-                        )
-                    )
-                else:
-                    checks.append(
-                        _mk_check(
-                            check_id="vehicle.atpv.renavam.matches_vehicle_doc",
-                            status="FAIL",
-                            message="RENAVAM do ATPV diverge do RENAVAM do documento do veículo.",
-                            evidence={"atpv": _mask_renavam(ren11_atpv), "vehicle": _mask_renavam(vehicle_ren11)},
-                        )
-                    )
-            else:
-                checks.append(
-                    _mk_check(
-                        check_id="vehicle.atpv.renavam.matches_vehicle_doc",
-                        status="OK",
-                        message="RENAVAM não comparável (ausente ou inválido em um dos documentos).",
-                        evidence={
-                            "atpv_valid": bool(ren11_atpv_valid),
-                            "vehicle_valid": bool(vehicle_ren_valid),
-                            "vehicle_doc_type": vehicle_doc_type,
-                        },
-                    )
+            checks.append(
+                _mk_check(
+                    check_id="vehicle.atpv.renavam.matches_vehicle_doc",
+                    status="FAIL",
+                    message="RENAVAM do ATPV diverge do RENAVAM do documento do veículo.",
+                    evidence={"atpv": _mask_renavam(ren11_atpv), "vehicle": _mask_renavam(vehicle_ren11)},
                 )
+            )
+    else:
+        checks.append(
+            _mk_check(
+                check_id="vehicle.atpv.renavam.matches_vehicle_doc",
+                status="OK",
+                message="RENAVAM não comparável (caso não suportado ou RENAVAM ausente/inválido em um dos documentos).",
+                evidence={
+                    "supported": bool(supported),
+                    "atpv_valid": bool(ren11_atpv_valid),
+                    "vehicle_valid": bool(vehicle_ren_valid),
+                    "vehicle_doc_type": vehicle_doc_type or "",
+                },
+            )
+        )
+
+    # ----------------------------
+    # ENDURECIMENTO (C): vendedor vinculante condicional (WARN por enquanto)
+    # ----------------------------
+    vendor_doc_raw = atpv.get("vendedor_cpf_cnpj")
+    vendor_doc = _only_digits(str(vendor_doc_raw or ""))
+    vendor_doc_valid = bool(
+        (len(vendor_doc) == 11 and _is_valid_cpf(vendor_doc))
+        or (len(vendor_doc) == 14 and _is_valid_cnpj(vendor_doc))
+    )
+
+    owner_doc = _extract_vehicle_owner_doc(vehicle_data)
+    owner_doc_valid = bool(
+        (len(owner_doc) == 11 and _is_valid_cpf(owner_doc))
+        or (len(owner_doc) == 14 and _is_valid_cnpj(owner_doc))
+    )
+
+    if owner_doc_valid and vendor_doc_valid:
+        if owner_doc == vendor_doc:
+            checks.append(
+                _mk_check(
+                    check_id="vehicle.atpv.vendedor.matches_vehicle_owner",
+                    status="OK",
+                    message="Documento do vendedor no ATPV coincide com o documento do proprietário no doc do veículo.",
+                    evidence={"vendedor": _mask_doc(vendor_doc), "proprietario": _mask_doc(owner_doc), "vehicle_doc_type": vehicle_doc_type or ""},
+                )
+            )
+        else:
+            checks.append(
+                _mk_check(
+                    check_id="vehicle.atpv.vendedor.matches_vehicle_owner",
+                    status="WARN",
+                    message="Vendedor do ATPV difere do proprietário no doc do veículo (vinculante condicional; WARN por enquanto).",
+                    evidence={"vendedor": _mask_doc(vendor_doc), "proprietario": _mask_doc(owner_doc), "vehicle_doc_type": vehicle_doc_type or ""},
+                )
+            )
+    else:
+        checks.append(
+            _mk_check(
+                check_id="vehicle.atpv.vendedor.matches_vehicle_owner",
+                status="OK",
+                message="Vendedor ↔ proprietário não comparável (documentos ausentes/inválidos).",
+                evidence={
+                    "vendor_valid": bool(vendor_doc_valid),
+                    "owner_valid": bool(owner_doc_valid),
+                    "vehicle_doc_type": vehicle_doc_type or "",
+                },
+            )
+        )
 
     # Followups (legado)
     checks.extend(_followup_checks())
@@ -486,11 +482,11 @@ def _followup_checks() -> List[Dict[str, Any]]:
         _mk_check(
             check_id="followup.atpv.renavam",
             status="OK",
-            message="FOLLOWUP: RENAVAM foi endurecido quando suportado; revisar cobertura de parsers de docs correlatos.",
+            message="FOLLOWUP: RENAVAM hard somente quando doc correlato traz RENAVAM válido (evita FAIL factory). Revisar parsers de docs correlatos para aumentar cobertura.",
         ),
         _mk_check(
             check_id="followup.atpv.vendedor",
             status="OK",
-            message="FOLLOWUP: Vendedor está informativo; revisar regra vinculante condicional quando houver docs correlatos.",
+            message="FOLLOWUP: Vendedor agora tem cross-check condicional com proprietário do doc do veículo (WARN). Evoluir para FAIL quando política for aprovada.",
         ),
     ]

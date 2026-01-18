@@ -130,3 +130,40 @@ def test_renavam_crosscheck_mismatch_fails_when_both_valid(tmp_path: Path) -> No
     assert chk["status"] == "FAIL"
     assert report.get("overall_status") == "FAIL"
     assert (report.get("summary") or {}).get("overall_status") == "FAIL"
+
+
+def test_required_if_supported_is_warn_when_vehicle_doc_has_no_valid_renavam(tmp_path: Path) -> None:
+    """Caso exista doc correlato mas sem RENAVAM válido extraído, não devemos exigir RENAVAM no ATPV.
+
+    Objetivo: evitar "FAIL factory" enquanto parsers de docs correlatos não cobrem RENAVAM de forma consistente.
+    """
+    r = _mk_case_roots(tmp_path)
+    case_id = str(r["case_id"])
+    phase1_case = r["phase1_case_root"]  # type: ignore[assignment]
+
+    _write_phase1_doc(phase1_case, "cnh", {"cpf": "11144477735", "nome": "MARIA IVONE FIGLERSKI"})
+    _neutralize_income_to_ok(phase1_case)
+
+    # Doc correlato presente, porém SEM renavam (ou inválido) => não suportado
+    _write_phase1_doc(phase1_case, "crlv_e", {"placa": "ASY6E68", "chassi": "9BD118181B1126184", "renavam": None})
+
+    # ATPV sem RENAVAM não pode virar FAIL nesse cenário
+    _write_phase1_doc(
+        phase1_case,
+        "atpv",
+        {
+            "placa": "ASY6E68",
+            "chassi": "9BD118181B1126184",
+            "valor_venda": "R$ 10.000,00",
+            "comprador_cpf_cnpj": "11144477735",
+            "comprador_nome": "MARIA IVONE FIGLERSKI",
+            "vendedor_nome": "CENTRAL VEICULOS LTDA",
+            "renavam": None,
+        },
+    )
+
+    report = build_master_report(case_id, phase1_root=r["phase1_root"], phase2_root=r["phase2_root"])  # type: ignore[arg-type]
+
+    chk = _find_check(report, "vehicle.atpv.renavam.required_if_supported")
+    assert chk["status"] == "WARN"
+    assert report.get("overall_status") in ("WARN", "OK")
