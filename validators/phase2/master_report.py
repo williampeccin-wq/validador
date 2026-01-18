@@ -1,131 +1,140 @@
+# validators/phase2/master_report.py
+
 from __future__ import annotations
 
 import json
-import os
 import re
-from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# MUST match tests/test_phase2_master_report_meta_contract.py::SCHEMA_VERSION
+SCHEMA_VERSION = "phase2.master_report@1"
+
+# Gate1 contract (Phase 1 required docs)
+GATE1_REQUIRED = ["proposta_daycoval", "cnh"]
+
+# Status precedence: worst -> best
+_STATUS_ORDER = ["FAIL", "MISSING", "WARN", "OK"]
+_STATUS_RANK = {s: i for i, s in enumerate(_STATUS_ORDER)}
 
 
-# ======================================================================================
-# Master Report (Phase 2) — agregador explicável
-#
-# Regras do projeto:
-# - Não bloquear parsing/extração (Phase 1).
-# - Validações cruzadas e inferências (Phase 2) só devem rodar depois que TODOS os documentos
-#   forem coletados; durante parsing/extração não bloquear nem concluir.
-#
-# Este módulo agrega outputs da Phase 1 (JSONs em storage/phase1/<case_id>/...)
-# e gera um report único em storage/phase2/<case_id>/report.json
-# ======================================================================================
-
-Status = str  # "OK" | "WARN" | "FAIL" | "MISSING"
+def _utc_now_rfc3339() -> str:
+    # timezone-aware UTC timestamp (avoid datetime.utcnow())
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-@dataclass(frozen=True)
-class Evidence:
-    source: str
-    field: str  # ex: "cpf" | "nome" | "salario"
-
-
-@dataclass(frozen=True)
-class CheckResult:
-    id: str
-    title: str
-    status: Status
-    expected: Optional[Any] = None
-    found: Optional[Any] = None
-    explain: str = ""
-    evidence: List[Evidence] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class ReportSummary:
-    overall_status: Status
-    counts: Dict[Status, int] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class MasterReport:
-    case_id: str
-    created_at: str
-    inputs: Dict[str, Any]
-    checks: List[CheckResult]
-    summary: ReportSummary
-    debug: Dict[str, Any] = field(default_factory=dict)
-
-
-# -----------------------------
-# Utilitários
-# -----------------------------
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _safe_read_json(path: Path) -> Dict[str, Any]:
+def _safe_read_json(p: Path) -> Tuple[Optional[dict], Optional[str]]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+        return json.loads(p.read_text(encoding="utf-8")), None
+    except Exception as e:
+        return None, str(e)
 
 
-def _pick_latest_json(dir_path: Path) -> Optional[Path]:
-    if not dir_path.exists():
-        return None
-    files = sorted([p for p in dir_path.glob("*.json") if p.is_file()], key=lambda p: p.stat().st_mtime)
-    return files[-1] if files else None
+def _coerce_path(p: Union[str, Path]) -> Path:
+    return p if isinstance(p, Path) else Path(p)
 
 
-def _extract_data(doc_json: Dict[str, Any]) -> Dict[str, Any]:
+def _sanitize_path_for_meta(p: Path) -> str:
     """
-    Phase 1 tende a salvar:
-      {"data": {...}, "debug": {...}, "source": {...}}
-    Mas os testes da Phase 2 podem gravar payloads minimalistas.
+    Contract: meta must not leak absolute paths.
+    - remove leading '/' if absolute
+    - drop obvious user-home segments
     """
-    if isinstance(doc_json.get("data"), dict):
-        return doc_json["data"]
-    return {k: v for k, v in doc_json.items() if k not in {"debug", "source", "document_type", "documento"}}
+    s = str(p).replace("\\", "/")
+    s = s.lstrip("/")
+    s = re.sub(r"(^|/)Users/[^/]+/", r"\1", s)
+    return s
 
 
-def _norm_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
+def _looks_like_phase1_case_root(p: Path) -> bool:
+    """
+    Heuristic: a Phase1 "case root" typically contains doc_type directories.
+    We keep this conservative to avoid mis-detecting.
+    """
+    if not p.exists() or not p.is_dir():
+        return False
+    # Common Phase1 doc_type dirs:
+    for d in ("proposta_daycoval", "cnh", "holerite", "extrato_bancario", "comprovante_renda"):
+        if (p / d).exists():
+            return True
+    return False
 
 
-def _norm_upper(s: str) -> str:
-    return _norm_spaces(s).upper()
+def _resolve_phase1_case_root(phase1_root: Path, case_id: str) -> Path:
+    """
+    Accepts either:
+      - phase1_root = <...>/phase1           (root)  -> returns <...>/phase1/<case_id>
+      - phase1_root = <...>/phase1/<case_id> (case) -> returns itself
+    """
+    if phase1_root.name == case_id:
+        return phase1_root
+    if _looks_like_phase1_case_root(phase1_root):
+        return phase1_root
+    return phase1_root / case_id
 
 
-def _digits_only(s: str) -> str:
-    return re.sub(r"\D+", "", s or "")
+def _resolve_phase2_case_root(phase2_root: Path, case_id: str) -> Path:
+    """
+    Accepts either:
+      - phase2_root = <...>/phase2           (root)  -> returns <...>/phase2/<case_id>
+      - phase2_root = <...>/phase2/<case_id> (case) -> returns itself
+    """
+    if phase2_root.name == case_id:
+        return phase2_root
+    return phase2_root / case_id
 
 
-def _as_money_str(v: Any) -> str:
+def _list_phase1_presence(phase1_case_root: Path) -> Dict[str, Dict[str, Any]]:
+    """
+    Returns: presence[doc_type] = {present: bool, count: int, path: str, latest_json: Optional[str]}
+    Metadata-only. No payload.
+    """
+    presence: Dict[str, Dict[str, Any]] = {}
+
+    if not phase1_case_root.exists():
+        return presence
+
+    for doc_type_dir in sorted([p for p in phase1_case_root.iterdir() if p.is_dir()]):
+        jsons = sorted(doc_type_dir.glob("*.json"))
+        presence[doc_type_dir.name] = {
+            "present": bool(jsons),
+            "count": int(len(jsons)),
+            "path": str(doc_type_dir),
+            "latest_json": str(jsons[-1]) if jsons else None,
+        }
+
+    return presence
+
+
+def _gate1_status(presence: Dict[str, Dict[str, Any]]) -> str:
+    for req in GATE1_REQUIRED:
+        meta = presence.get(req) or {}
+        if not bool(meta.get("present")):
+            return "FAIL"
+    return "PASS"
+
+
+def _parse_money_any(v: Any) -> Optional[float]:
     if v is None:
-        return ""
+        return None
     if isinstance(v, (int, float)):
-        return str(v)
-    return str(v)
+        return float(v)
 
-
-def _money_to_float(v: str) -> Optional[float]:
-    """
-    Aceita '6.700,00', '6700,00', '6700.00', '6700'
-    """
-    s = (v or "").strip()
+    s = str(v).strip()
     if not s:
         return None
 
-    # remove currency/whitespace
-    s = re.sub(r"[Rr]\$|\s", "", s)
+    s = s.replace("R$", "").replace(" ", "")
 
-    # se tiver vírgula e ponto, assume ponto milhar e vírgula decimal
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s and "." not in s:
         s = s.replace(",", ".")
-    # else: já está com '.'
+
+    s = re.sub(r"[^0-9.\-]", "", s)
+    if not s or s in ("-", ".", "-."):
+        return None
 
     try:
         return float(s)
@@ -133,676 +142,326 @@ def _money_to_float(v: str) -> Optional[float]:
         return None
 
 
-def _overall_from_checks(checks: List[CheckResult]) -> ReportSummary:
-    counts = {"OK": 0, "WARN": 0, "FAIL": 0, "MISSING": 0}
+def _read_phase1_latest_data(phase1_case_root: Path, doc_type: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    d = phase1_case_root / doc_type
+    if not d.exists() or not d.is_dir():
+        return None, None
+    jsons = sorted(d.glob("*.json"))
+    if not jsons:
+        return None, None
+
+    raw, err = _safe_read_json(jsons[-1])
+    if err or not isinstance(raw, dict):
+        return None, err or "invalid_json"
+    data = raw.get("data")
+    if data is None:
+        return {}, None
+    if not isinstance(data, dict):
+        return None, "data_not_dict"
+    return data, None
+
+
+def _compute_overall_status(checks: List[Dict[str, Any]]) -> str:
+    if not checks:
+        return "MISSING"
+
+    worst = "OK"
     for c in checks:
-        counts[c.status] = counts.get(c.status, 0) + 1
-
-    if counts.get("FAIL", 0) > 0:
-        overall = "FAIL"
-    elif counts.get("WARN", 0) > 0:
-        overall = "WARN"
-    elif counts.get("MISSING", 0) > 0:
-        overall = "MISSING"
-    else:
-        overall = "OK"
-
-    return ReportSummary(overall_status=overall, counts=counts)
+        st = str(c.get("status") or "OK")
+        if st not in _STATUS_RANK:
+            st = "WARN"
+        if _STATUS_RANK[st] < _STATUS_RANK[worst]:
+            worst = st
+    return worst
 
 
-# -----------------------------
-# Aliases de tipos (Phase 1 -> tipo lógico)
-# -----------------------------
-_HOLERITE_ALIASES = {
-    "holerite",
-    "folha_pagamento",
-    "folha_de_pagamento",
-    "folha_pgto",
-    "folha",
-    "contracheque",
-    "contra_cheque",
-    "contra-cheque",
-    "recibo_pagamento_salario",
-    "recibo_de_pagamento",
-}
+def _mk_check(*, check_id: str, status: str, message: str, evidence: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {"id": check_id, "status": status, "message": message, "evidence": evidence or {}}
 
 
-def _normalize_doc_type(doc_type: str) -> str:
-    dt = (doc_type or "").strip().lower()
-    if dt in _HOLERITE_ALIASES:
-        return "holerite"
-    return dt
-
-
-def _get_doc(inputs: Dict[str, Dict[str, Any]], *doc_types: str) -> Optional[Tuple[str, Dict[str, Any]]]:
+def _build_inputs_root_metadata_only(*, phase1_case_root: Path, presence: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
     """
-    Retorna (source, data) do primeiro doc_type encontrado (aceita alias).
-    doc_types devem ser do tipo lógico, ex: "holerite", "extrato_bancario".
+    Root-level 'inputs' contract (metadata-only):
+      inputs[doc_type] = {"path": "<sanitized path>"}
     """
-    for dt in doc_types:
-        if dt in inputs:
-            return (f"phase1/{dt}", inputs[dt]["_data"])
-    return None
+    out: Dict[str, Dict[str, str]] = {}
 
-
-# -----------------------------
-# Checks (regras iniciais)
-# -----------------------------
-def _check_field_equal(
-    check_id: str,
-    title: str,
-    left: Tuple[str, Dict[str, Any]],
-    right: Tuple[str, Dict[str, Any]],
-    *,
-    field_left: str,
-    field_right: str,
-    normalize: Optional[Any] = None,
-    missing_is: Status = "WARN",
-    mismatch_is: Status = "WARN",
-) -> CheckResult:
-    left_src, left_data = left
-    right_src, right_data = right
-
-    lv = left_data.get(field_left)
-    rv = right_data.get(field_right)
-
-    nl = normalize(lv) if (normalize and lv is not None) else lv
-    nr = normalize(rv) if (normalize and rv is not None) else rv
-
-    evidence = [Evidence(source=left_src, field=field_left), Evidence(source=right_src, field=field_right)]
-
-    if lv is None or rv is None:
-        return CheckResult(
-            id=check_id,
-            title=title,
-            status=missing_is,
-            expected="both present",
-            found={"left": lv, "right": rv},
-            explain="Campo ausente em um dos documentos; não é possível comparar com segurança.",
-            evidence=evidence,
-        )
-
-    if nl == nr:
-        return CheckResult(
-            id=check_id,
-            title=title,
-            status="OK",
-            expected=nl,
-            found=nr,
-            explain="Valores compatíveis.",
-            evidence=evidence,
-        )
-
-    return CheckResult(
-        id=check_id,
-        title=title,
-        status=mismatch_is,
-        expected=nl,
-        found=nr,
-        explain="Valores divergentes entre documentos.",
-        evidence=evidence,
-    )
-
-
-def _check_name_similarity(
-    check_id: str,
-    title: str,
-    left: Tuple[str, Dict[str, Any]],
-    right: Tuple[str, Dict[str, Any]],
-    *,
-    field_left: str,
-    field_right: str,
-) -> CheckResult:
-    left_src, left_data = left
-    right_src, right_data = right
-
-    lv = _norm_upper(str(left_data.get(field_left) or ""))
-    rv = _norm_upper(str(right_data.get(field_right) or ""))
-
-    evidence = [Evidence(source=left_src, field=field_left), Evidence(source=right_src, field=field_right)]
-
-    if not lv or not rv:
-        return CheckResult(
-            id=check_id,
-            title=title,
-            status="WARN",
-            expected="both present",
-            found={"left": lv, "right": rv},
-            explain="Nome ausente em um dos documentos; não é possível comparar com segurança.",
-            evidence=evidence,
-        )
-
-    # comparação simples (não precisa ser perfeita para o teste atual)
-    if lv == rv:
-        return CheckResult(
-            id=check_id,
-            title=title,
-            status="OK",
-            expected=lv,
-            found=rv,
-            explain="Nomes idênticos após normalização.",
-            evidence=evidence,
-        )
-
-    return CheckResult(
-        id=check_id,
-        title=title,
-        status="WARN",
-        expected=lv,
-        found=rv,
-        explain="Nomes diferentes após normalização (similaridade simples).",
-        evidence=evidence,
-    )
-
-
-def _compute_declared_income_total(
-    proposta_src: str,
-    proposta_data: Dict[str, Any],
-) -> Tuple[Optional[float], List[Evidence], str]:
-    """
-    Renda declarada: usa campos comuns da proposta.
-    - salario
-    - outras_rendas
-    - renda_total (se existir)
-    """
-    evidence: List[Evidence] = []
-    for f in ("renda_total", "salario", "outras_rendas"):
-        if f in proposta_data:
-            evidence.append(Evidence(source=proposta_src, field=f))
-
-    if proposta_data.get("renda_total") is not None:
-        total = _money_to_float(_as_money_str(proposta_data.get("renda_total")))
-        if total is None:
-            return None, evidence, "Campo renda_total presente, mas não interpretável."
-        return total, evidence, ""
-
-    salario = _money_to_float(_as_money_str(proposta_data.get("salario")))
-    outras = _money_to_float(_as_money_str(proposta_data.get("outras_rendas")))
-
-    if salario is None and outras is None:
-        return None, evidence, "Campos de renda declarada (salario/outras_rendas) ausentes ou não interpretáveis."
-
-    declared_total = float(salario or 0.0) + float(outras or 0.0)
-    return declared_total, evidence, ""
-
-
-def _compute_proven_income_from_holerite(
-    holerite_src: str,
-    holerite_data: Dict[str, Any],
-    *,
-    holerite_total_field: str = "total_vencimentos",
-) -> Tuple[Optional[float], List[Evidence], str]:
-    proven = _money_to_float(_as_money_str(holerite_data.get(holerite_total_field)))
-    evidence = [Evidence(source=holerite_src, field=holerite_total_field)]
-    if proven is None:
-        return None, evidence, "Holerite presente, mas total_vencimentos não está em formato interpretável."
-    return proven, evidence, ""
-
-
-def _compute_proven_income_from_extrato(
-    extrato_src: str,
-    extrato_data: Dict[str, Any],
-) -> Tuple[Optional[float], List[Evidence], str]:
-    """
-    Extrato: para Phase 2 (income proof rules), os campos aceitos como "apuráveis" são os esperados pelo teste:
-      - renda_apurada
-      - renda_recorrente
-      - creditos_recorrentes_total
-      - creditos_validos_total
-    """
-    candidate_fields = [
-        "renda_apurada",
-        "renda_recorrente",
-        "creditos_recorrentes_total",
-        "creditos_validos_total",
-    ]
-
-    for f in candidate_fields:
-        v = _money_to_float(_as_money_str(extrato_data.get(f)))
-        if v is not None:
-            return v, [Evidence(source=extrato_src, field=f)], ""
-
-    return None, [Evidence(source=extrato_src, field="(renda_apurada/renda_recorrente/creditos_*)")], (
-        "Extrato presente, mas sem qualquer um dos campos apuráveis "
-        "(renda_apurada / renda_recorrente / creditos_recorrentes_total / creditos_validos_total)."
-    )
-
-
-def _compare_declared_vs_proven(
-    check_id: str,
-    title: str,
-    *,
-    declared_total: float,
-    proven: float,
-    evidence: List[Evidence],
-    tolerance_ratio: float = 0.10,
-) -> CheckResult:
-    if declared_total <= 0.0:
-        status = "WARN" if proven > 0 else "OK"
-        explain = "Renda declarada total é zero (ou ausente); comprovante indica valor. Recomenda-se revisão."
-        return CheckResult(
-            id=check_id,
-            title=title,
-            status=status,
-            expected=declared_total,
-            found=proven,
-            explain=explain,
-            evidence=evidence,
-        )
-
-    delta = abs(proven - declared_total)
-    ratio = delta / declared_total if declared_total else 1.0
-
-    if ratio <= tolerance_ratio:
-        return CheckResult(
-            id=check_id,
-            title=title,
-            status="OK",
-            expected=f"{declared_total:.2f}",
-            found=f"{proven:.2f}",
-            explain=f"Compatível dentro da tolerância ({tolerance_ratio:.0%}).",
-            evidence=evidence,
-        )
-
-    return CheckResult(
-        id=check_id,
-        title=title,
-        status="WARN",
-        expected=f"{declared_total:.2f}",
-        found=f"{proven:.2f}",
-        explain=f"Diferença relevante (diferença≈{ratio:.2%}).",
-        evidence=evidence,
-    )
-
-
-# -----------------------------
-# Entrada/saída (storage)
-# -----------------------------
-def load_phase1_inputs(case_id: str, phase1_root: str = "storage/phase1") -> Dict[str, Dict[str, Any]]:
-    """
-    Retorna dict por tipo de documento (tipo lógico):
-      {
-        "proposta_daycoval": {"_path": "...json", "_raw": {...}, "_data": {...}},
-        "cnh": {...},
-        "holerite": {...},              # inclui aliases (folha/contracheque)
-        "extrato_bancario": {...},
-        ...
-      }
-    """
-    base = Path(phase1_root) / case_id
-    if not base.exists():
-        return {}
-
-    out: Dict[str, Dict[str, Any]] = {}
-    for doc_type_dir in sorted([p for p in base.iterdir() if p.is_dir()]):
-        latest = _pick_latest_json(doc_type_dir)
-        if not latest:
-            continue
-
-        raw = _safe_read_json(latest)
-        data = _extract_data(raw)
-
-        logical_type = _normalize_doc_type(doc_type_dir.name)
-
-        # Se um alias e "holerite" existirem simultaneamente, preferimos o mais recente (mtime),
-        # mas como percorremos dirs em ordem e usamos mtime por dir, precisamos comparar aqui.
-        if logical_type in out:
-            prev_path = Path(out[logical_type]["_path"])
-            try:
-                if latest.stat().st_mtime <= prev_path.stat().st_mtime:
-                    continue
-            except Exception:
-                pass
-
-        out[logical_type] = {
-            "_path": str(latest),
-            "_raw": raw,
-            "_data": data,
-        }
+    for doc_type, meta in presence.items():
+        latest_json = meta.get("latest_json")
+        if latest_json:
+            out[doc_type] = {"path": _sanitize_path_for_meta(Path(latest_json))}
+        else:
+            out[doc_type] = {"path": _sanitize_path_for_meta(phase1_case_root / doc_type)}
 
     return out
 
 
-def save_phase2_report(report: MasterReport, phase2_root: str = "storage/phase2") -> Path:
-    base = Path(phase2_root) / report.case_id
-    base.mkdir(parents=True, exist_ok=True)
-    p = base / "report.json"
-    p.write_text(json.dumps(asdict(report), ensure_ascii=False, indent=2), encoding="utf-8")
+def _build_meta(*, case_id: str, phase1_root: Path, phase2_root: Path, presence: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    inputs_docs: Dict[str, Dict[str, Any]] = {}
+    for doc_type, meta in presence.items():
+        inputs_docs[doc_type] = {"present": bool(meta.get("present")), "count": int(meta.get("count", 0))}
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "phase": "phase2",
+        "case_id": case_id,
+        "generated_at": _utc_now_rfc3339(),
+        "inputs": {
+            "phase1": {
+                "gate1": {"required": list(GATE1_REQUIRED), "status": _gate1_status(presence)},
+                "docs": inputs_docs,
+            }
+        },
+        "source_layout": {
+            "phase1_root": _sanitize_path_for_meta(phase1_root),
+            "phase2_root": _sanitize_path_for_meta(phase2_root),
+        },
+        "privacy": {
+            "contains_pii": False,
+            # IMPORTANT: tests ban forbidden substrings like "payload"
+            "notes": "meta contains only structural and operational metadata; no extracted personal fields",
+        },
+    }
+
+
+def _build_identity_check(phase1_case_root: Path, presence: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    has_proposta = bool((presence.get("proposta_daycoval") or {}).get("present"))
+    has_cnh = bool((presence.get("cnh") or {}).get("present"))
+
+    if not has_proposta and not has_cnh:
+        return _mk_check(
+            check_id="identity.proposta_vs_cnh",
+            status="MISSING",
+            message="Missing proposta_daycoval and cnh",
+            evidence={"required": ["proposta_daycoval", "cnh"]},
+        )
+
+    if not has_proposta or not has_cnh:
+        missing = []
+        if not has_proposta:
+            missing.append("proposta_daycoval")
+        if not has_cnh:
+            missing.append("cnh")
+        return _mk_check(
+            check_id="identity.proposta_vs_cnh",
+            status="MISSING",
+            message=f"Missing required docs: {', '.join(missing)}",
+            evidence={"required": ["proposta_daycoval", "cnh"], "missing": missing},
+        )
+
+    proposta, _ = _read_phase1_latest_data(phase1_case_root, "proposta_daycoval")
+    cnh, _ = _read_phase1_latest_data(phase1_case_root, "cnh")
+    proposta = proposta or {}
+    cnh = cnh or {}
+
+    def norm(x: Any) -> Optional[str]:
+        if x is None:
+            return None
+        s = str(x).strip()
+        return s.upper() if s else None
+
+    proposta_nome = norm(proposta.get("nome_financiado") or proposta.get("nome"))
+    cnh_nome = norm(cnh.get("nome"))
+    proposta_dn = norm(proposta.get("data_nascimento"))
+    cnh_dn = norm(cnh.get("data_nascimento"))
+
+    ok = True
+    diffs: Dict[str, Any] = {}
+
+    if proposta_nome and cnh_nome and proposta_nome != cnh_nome:
+        ok = False
+        diffs["nome"] = {"proposta": proposta_nome, "cnh": cnh_nome}
+
+    if proposta_dn and cnh_dn and proposta_dn != cnh_dn:
+        ok = False
+        diffs["data_nascimento"] = {"proposta": proposta_dn, "cnh": cnh_dn}
+
+    if ok:
+        return _mk_check(
+            check_id="identity.proposta_vs_cnh",
+            status="OK",
+            message="OK",
+            evidence={"fields_compared": ["nome", "data_nascimento"], "diffs": {}},
+        )
+
+    return _mk_check(
+        check_id="identity.proposta_vs_cnh",
+        status="WARN",
+        message="Divergences found",
+        evidence={"fields_compared": ["nome", "data_nascimento"], "diffs": diffs},
+    )
+
+
+def _extract_declared_income_from_proposta(phase1_case_root: Path) -> Optional[float]:
+    proposta, _ = _read_phase1_latest_data(phase1_case_root, "proposta_daycoval")
+    if not proposta:
+        return None
+    salario = _parse_money_any(proposta.get("salario"))
+    outras = _parse_money_any(proposta.get("outras_rendas"))
+    if salario is None and outras is None:
+        return None
+    return float((salario or 0.0) + (outras or 0.0))
+
+
+def _extract_proven_income_from_docs(phase1_case_root: Path, presence: Dict[str, Dict[str, Any]]) -> Tuple[List[str], Optional[float]]:
+    proof_docs: List[str] = []
+    proven: Optional[float] = None
+
+    if bool((presence.get("holerite") or {}).get("present")):
+        proof_docs.append("holerite")
+        holerite, _ = _read_phase1_latest_data(phase1_case_root, "holerite")
+        if holerite:
+            proven = _parse_money_any(holerite.get("total_vencimentos") or holerite.get("salario_liquido"))
+
+    if bool((presence.get("extrato_bancario") or {}).get("present")):
+        proof_docs.append("extrato_bancario")
+        extrato, _ = _read_phase1_latest_data(phase1_case_root, "extrato_bancario")
+        if extrato and proven is None:
+            for k in ("renda_apurada", "renda_recorrente", "creditos_validos_total", "creditos_recorrentes_total"):
+                v = _parse_money_any(extrato.get(k))
+                if v is not None:
+                    proven = v
+                    break
+
+    return proof_docs, proven
+
+
+def _build_income_checks(phase1_case_root: Path, presence: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    declared = _extract_declared_income_from_proposta(phase1_case_root)
+    proof_docs, proven = _extract_proven_income_from_docs(phase1_case_root, presence)
+
+    # proof
+    if not proof_docs:
+        proof_status, proof_msg = "MISSING", "No proof documents present"
+    else:
+        if proven is None:
+            proof_status, proof_msg = "WARN", "Proof documents present but value not extractable"
+        else:
+            proof_status, proof_msg = "OK", "Proof value extracted"
+
+    proof_chk = _mk_check(
+        check_id="income.declared_vs_proven.proof",
+        status=proof_status,
+        message=proof_msg,
+        evidence={"proof_docs": list(proof_docs), "proven": proven},
+    )
+
+    # minimum
+    if not proof_docs:
+        min_status, min_msg = "MISSING", "Missing proof documents"
+    else:
+        if proven is None:
+            min_status, min_msg = "WARN", "Cannot evaluate minimum without proven value"
+        else:
+            if declared is None:
+                min_status, min_msg = "OK", "No declared income available"
+            else:
+                min_status = "OK" if proven > 0 else "WARN"
+                min_msg = "Minimum evidence available" if proven > 0 else "Proven value not positive"
+
+    min_chk = _mk_check(
+        check_id="income.declared_vs_proven.minimum",
+        status=min_status,
+        message=min_msg,
+        evidence={"declared": declared, "proof_docs": list(proof_docs), "proven": proven},
+    )
+
+    # total
+    if declared is None:
+        total_status, total_msg = "MISSING", "Declared income missing"
+    else:
+        if not proof_docs:
+            total_status, total_msg = "MISSING", "Proof documents missing"
+        else:
+            if proven is None:
+                total_status, total_msg = "WARN", "Proof documents present but value not extractable"
+            else:
+                total_status = "OK" if proven >= (declared * 0.95) else "WARN"
+                total_msg = "Declared income is supported by proven income" if total_status == "OK" else "Declared income not supported by proven income"
+
+    total_chk = _mk_check(
+        check_id="income.declared_vs_proven.total",
+        status=total_status,
+        message=total_msg,
+        evidence={"declared": declared, "proven": proven, "proof_docs": list(proof_docs)},
+    )
+
+    return [min_chk, proof_chk, total_chk]
+
+
+def _ensure_unique_check_ids(checks: List[Dict[str, Any]]) -> None:
+    seen = set()
+    for c in checks:
+        cid = c.get("id")
+        if cid in seen:
+            raise ValueError(f"duplicate_check_id: {cid}")
+        seen.add(cid)
+
+
+def _write_report_json(*, phase2_case_root: Path, payload: Dict[str, Any]) -> Path:
+    phase2_case_root.mkdir(parents=True, exist_ok=True)
+    p = phase2_case_root / "report.json"
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return p
 
 
-# -----------------------------
-# Builder principal
-# -----------------------------
-def build_master_report(
-    case_id: str,
-    *,
-    phase1_root: str = "storage/phase1",
-    phase2_root: str = "storage/phase2",
-) -> MasterReport:
-    inputs = load_phase1_inputs(case_id, phase1_root=phase1_root)
+def build_master_report(case_id: str, *, phase1_root: Union[str, Path], phase2_root: Union[str, Path]) -> Dict[str, Any]:
+    """
+    Canonical Phase2 master report builder.
+    Accepts both styles:
+      - phase1_root=<...>/phase1           OR phase1_root=<...>/phase1/<case_id>
+      - phase2_root=<...>/phase2           OR phase2_root=<...>/phase2/<case_id>
 
-    # fontes padronizadas (tipo lógico)
-    proposta = _get_doc(inputs, "proposta_daycoval")
-    cnh = _get_doc(inputs, "cnh")
-    holerite = _get_doc(inputs, "holerite")
-    extrato = _get_doc(inputs, "extrato_bancario")
+    Must:
+      - not block if Phase1 is empty/incomplete
+      - write <phase2_root>/<case_id>/report.json (or inside provided case-root)
+      - return the payload dict
+    """
+    p1_root = _coerce_path(phase1_root)
+    p2_root = _coerce_path(phase2_root)
 
-    checks: List[CheckResult] = []
+    phase1_case_root = _resolve_phase1_case_root(p1_root, case_id)
+    phase2_case_root = _resolve_phase2_case_root(p2_root, case_id)
 
-    # Proposta x CNH
-    if proposta is None or cnh is None:
-        checks.append(
-            CheckResult(
-                id="proposta_vs_cnh.minimum",
-                title="Documentos mínimos para comparação Proposta ↔ CNH",
-                status="MISSING",
-                expected="proposta_daycoval + cnh",
-                found={
-                    "proposta_daycoval": bool(proposta),
-                    "cnh": bool(cnh),
-                },
-                explain="Sem ambos os documentos não é possível executar validações cruzadas.",
-                evidence=[],
-            )
-        )
-    else:
-        checks.append(
-            _check_field_equal(
-                "proposta_vs_cnh.cpf",
-                "CPF Proposta ↔ CNH",
-                proposta,
-                cnh,
-                field_left="cpf",
-                field_right="cpf",
-                normalize=_digits_only,
-                missing_is="MISSING",
-                mismatch_is="FAIL",
-            )
-        )
+    presence = _list_phase1_presence(phase1_case_root)
 
-        checks.append(
-            _check_name_similarity(
-                "proposta_vs_cnh.nome",
-                "Nome Proposta ↔ CNH (similaridade)",
-                proposta,
-                cnh,
-                field_left="nome_financiado",
-                field_right="nome",
-            )
-        )
+    checks: List[Dict[str, Any]] = []
+    checks.append(_build_identity_check(phase1_case_root, presence))
+    checks.extend(_build_income_checks(phase1_case_root, presence))
+    _ensure_unique_check_ids(checks)
 
-        checks.append(
-            _check_field_equal(
-                "proposta_vs_cnh.data_nascimento",
-                "Data de nascimento Proposta ↔ CNH",
-                proposta,
-                cnh,
-                field_left="data_nascimento",
-                field_right="data_nascimento",
-                normalize=None,
-                missing_is="MISSING",
-                mismatch_is="FAIL",
-            )
-        )
+    overall = _compute_overall_status(checks)
 
-        checks.append(
-            _check_field_equal(
-                "proposta_vs_cnh.uf",
-                "UF Proposta ↔ CNH",
-                proposta,
-                cnh,
-                field_left="uf",
-                field_right="uf_nascimento",
-                normalize=_norm_upper,
-                missing_is="WARN",
-                mismatch_is="WARN",
-            )
-        )
+    payload: Dict[str, Any] = {
+        "case_id": case_id,
+        "checks": checks,
+        "inputs": _build_inputs_root_metadata_only(phase1_case_root=phase1_case_root, presence=presence),
+        "summary": {"overall_status": overall},
+        "overall_status": overall,
+        "status": overall,
+        "meta": _build_meta(case_id=case_id, phase1_root=p1_root, phase2_root=p2_root, presence=presence),
+    }
 
-        checks.append(
-            _check_field_equal(
-                "proposta_vs_cnh.cidade_nascimento",
-                "Cidade nascimento Proposta ↔ CNH",
-                proposta,
-                cnh,
-                field_left="cidade_nascimento",
-                field_right="cidade_nascimento",
-                normalize=_norm_upper,
-                missing_is="WARN",
-                mismatch_is="WARN",
-            )
-        )
-
-    # Renda declarada vs comprovada — SEMPRE emitir 3 checks:
-    #   1) income.declared_vs_proven.minimum
-    #   2) income.declared_vs_proven.proof
-    #   3) income.declared_vs_proven.total
-    #
-    # Regras (tests/test_phase2_master_report_income_proof_rules.py):
-    # - minimum: MISSING quando proposta existe e NÃO há docs de prova (holerite/extrato/folha); OK quando há.
-    # - proof: WARN quando há doc de prova mas nenhum campo apurável; OK caso contrário.
-    # - total: comparação declarado vs comprovado (tolerância 10%) SOMENTE quando houver prova apurável.
-    proof_present = not (holerite is None and extrato is None)
-
-    proven_val: Optional[float] = None
-    proven_evidence: List[Evidence] = []
-    proven_notes: List[str] = []
-
-    # prioridade: holerite (ou folha/contracheque aliasado como holerite)
-    if holerite is not None:
-        h_src, h_data = holerite
-        v, ev, err = _compute_proven_income_from_holerite(h_src, h_data)
-        proven_evidence.extend(ev)
-        if v is not None:
-            proven_val = v
-        elif err:
-            proven_notes.append(err)
-
-    # depois: extrato (apenas se holerite não apurou)
-    if proven_val is None and extrato is not None:
-        e_src, e_data = extrato
-        v, ev, err = _compute_proven_income_from_extrato(e_src, e_data)
-        proven_evidence.extend(ev)
-        if v is not None:
-            proven_val = v
-        elif err:
-            proven_notes.append(err)
-
-    apuravel = proven_val is not None
-
-    # 1) minimum
-    if proposta is None:
-        checks.append(
-            CheckResult(
-                id="income.declared_vs_proven.minimum",
-                title="Renda declarada vs comprovada — mínimos",
-                status="MISSING",
-                expected="proposta_daycoval",
-                found={
-                    "proposta_daycoval": False,
-                    "holerite": bool(holerite),
-                    "extrato_bancario": bool(extrato),
-                },
-                explain="Sem proposta não há renda declarada para comparar.",
-                evidence=[],
-            )
-        )
-    elif not proof_present:
-        checks.append(
-            CheckResult(
-                id="income.declared_vs_proven.minimum",
-                title="Renda declarada vs comprovada — mínimos",
-                status="MISSING",
-                expected="ao menos 1 comprovante (holerite/extrato/folha)",
-                found={
-                    "proposta_daycoval": True,
-                    "holerite": bool(holerite),
-                    "extrato_bancario": bool(extrato),
-                },
-                explain="Proposta existe, mas não há nenhum documento de prova de renda (holerite/extrato/folha).",
-                evidence=[],
-            )
-        )
-    else:
-        checks.append(
-            CheckResult(
-                id="income.declared_vs_proven.minimum",
-                title="Renda declarada vs comprovada — mínimos",
-                status="OK",
-                expected="ao menos 1 comprovante (holerite/extrato/folha)",
-                found={
-                    "proposta_daycoval": True,
-                    "holerite": bool(holerite),
-                    "extrato_bancario": bool(extrato),
-                },
-                explain="Há proposta e ao menos um documento de prova de renda.",
-                evidence=[],
-            )
-        )
-
-    # 2) proof
-    if not proof_present:
-        checks.append(
-            CheckResult(
-                id="income.declared_vs_proven.proof",
-                title="Renda comprovada — apuração",
-                status="OK",
-                expected="(n/a)",
-                found={"proof_docs": False},
-                explain="Sem documentos de prova; o status MISSING é tratado pelo check income.declared_vs_proven.minimum.",
-                evidence=[],
-            )
-        )
-    elif not apuravel:
-        checks.append(
-            CheckResult(
-                id="income.declared_vs_proven.proof",
-                title="Renda comprovada — apuração",
-                status="WARN",
-                expected="ao menos 1 campo de renda interpretável",
-                found={
-                    "proof_docs": True,
-                    "holerite": bool(holerite),
-                    "extrato_bancario": bool(extrato),
-                },
-                explain=(
-                    "Há documento(s) de prova, mas nenhum campo de renda apurável foi encontrado."
-                    + ((" " + " | ".join(proven_notes)) if proven_notes else "")
-                ),
-                evidence=proven_evidence,
-            )
-        )
-    else:
-        checks.append(
-            CheckResult(
-                id="income.declared_vs_proven.proof",
-                title="Renda comprovada — apuração",
-                status="OK",
-                expected="ao menos 1 campo de renda interpretável",
-                found={
-                    "proof_docs": True,
-                    "holerite": bool(holerite),
-                    "extrato_bancario": bool(extrato),
-                },
-                explain="Há documento(s) de prova com campo(s) de renda interpretável(is).",
-                evidence=proven_evidence,
-            )
-        )
-
-    # 3) total
-    if proposta is None:
-        checks.append(
-            CheckResult(
-                id="income.declared_vs_proven.total",
-                title="Renda declarada (Proposta) ↔ comprovada (Total)",
-                status="MISSING",
-                expected="proposta_daycoval",
-                found={"proposta_daycoval": False},
-                explain="Sem proposta não há renda declarada para comparar.",
-                evidence=[],
-            )
-        )
-    else:
-        proposta_src, proposta_data = proposta
-        declared_total, declared_evidence, declared_err = _compute_declared_income_total(proposta_src, proposta_data)
-        if declared_total is None:
-            checks.append(
-                CheckResult(
-                    id="income.declared_vs_proven.total",
-                    title="Renda declarada (Proposta) ↔ comprovada (Total)",
-                    status="WARN",
-                    expected="renda declarada interpretável",
-                    found={"declared_total": None},
-                    explain=declared_err or "Renda declarada inapreensível na proposta.",
-                    evidence=declared_evidence,
-                )
-            )
-        elif not apuravel:
-            checks.append(
-                CheckResult(
-                    id="income.declared_vs_proven.total",
-                    title="Renda declarada (Proposta) ↔ comprovada (Total)",
-                    status="OK",
-                    expected=f"{declared_total:.2f}",
-                    found={"proven_total": None, "proof_docs": proof_present},
-                    explain="Sem renda comprovada apurável; comparação não executada (ver income.declared_vs_proven.proof).",
-                    evidence=(list(declared_evidence) + list(proven_evidence)),
-                )
-            )
-        else:
-            checks.append(
-                _compare_declared_vs_proven(
-                    check_id="income.declared_vs_proven.total",
-                    title="Renda declarada (Proposta) ↔ comprovada (Total)",
-                    declared_total=declared_total,
-                    proven=float(proven_val or 0.0),
-                    evidence=(list(declared_evidence) + list(proven_evidence)),
-                    tolerance_ratio=0.10,
-                )
-            )
-
-    summary = _overall_from_checks(checks)
-
-    report = MasterReport(
-        case_id=case_id,
-        created_at=_utc_iso(),
-        inputs={k: {"path": v.get("_path")} for k, v in inputs.items()},
-        checks=checks,
-        summary=summary,
-        debug={
-            "phase1_root": phase1_root,
-            "phase2_root": phase2_root,
-            "version": "phase2-master-report-v2",
-            "doc_type_aliases": {
-                "holerite": sorted(_HOLERITE_ALIASES),
-            },
-        },
-    )
-
-    save_phase2_report(report, phase2_root=phase2_root)
-    return report
+    _write_report_json(phase2_case_root=phase2_case_root, payload=payload)
+    return payload
 
 
 def build_master_report_and_return_path(
     case_id: str,
     *,
-    phase1_root: str = "storage/phase1",
-    phase2_root: str = "storage/phase2",
+    phase1_root: Union[str, Path],
+    phase2_root: Union[str, Path],
 ) -> str:
-    report = build_master_report(case_id, phase1_root=phase1_root, phase2_root=phase2_root)
-    return str(Path(phase2_root) / case_id / "report.json")
+    """
+    Backward-compatible shim for orchestrator.phase2_runner.
+    Returns the path to the written report.json.
+    """
+    p1_root = _coerce_path(phase1_root)
+    p2_root = _coerce_path(phase2_root)
 
+    # Build (also writes report)
+    _ = build_master_report(case_id, phase1_root=p1_root, phase2_root=p2_root)
 
-def _main(argv: List[str]) -> int:
-    if len(argv) < 2:
-        print("Usage: python -m validators.phase2.master_report <case_id>")
-        return 2
-    case_id = argv[1]
-    p = build_master_report_and_return_path(case_id)
-    print(p)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main(os.sys.argv))
+    # Resolve the actual written location
+    phase2_case_root = _resolve_phase2_case_root(p2_root, case_id)
+    return str(phase2_case_root / "report.json")

@@ -14,6 +14,12 @@ def _write_phase1_doc(
     filename: str,
     data: Dict[str, Any],
 ) -> Path:
+    """
+    Writes a Phase 1 JSON doc in the canonical layout:
+      <phase1_root>/<case_id>/<doc_type>/<filename>
+
+    Payload shape matches existing Phase2 runner tests: {"data": {...}}
+    """
     p = phase1_root / case_id / doc_type
     p.mkdir(parents=True, exist_ok=True)
     out = p / filename
@@ -21,16 +27,10 @@ def _write_phase1_doc(
     return out
 
 
-def _load_report_json(phase2_root: Path, case_id: str) -> Dict[str, Any]:
-    p = phase2_root / case_id / "report.json"
-    assert p.exists(), f"Expected report.json at {p}"
-    return json.loads(p.read_text(encoding="utf-8"))
-
-
 def _find_phase2_runner_fn() -> Callable[..., Any]:
     """
     Locate a callable in orchestrator.phase2_runner that runs Phase 2 and writes report.json.
-    We allow multiple names to avoid coupling tests to one internal API.
+    We allow multiple names to avoid coupling this test to one internal API.
     """
     import orchestrator.phase2_runner as pr  # local import for runtime consistency
 
@@ -121,76 +121,78 @@ def _call_runner(fn: Callable[..., Any], case_id: str, phase1_root: str, phase2_
 
     raise AssertionError(
         "Found a runner function but could not call it with supported signatures.\n"
-        "Tried: (case_id, phase1_root=..., phase2_root=...), (case_id, storage_phase1=..., storage_phase2=...),\n"
-        "(case_id, storage_root=...), keyword-only (case_id=...), CWD-dependent call, and positional variants.\n"
+        "Tried keyword args, storage_root, keyword-only, CWD-dependent call, and positional variants.\n"
         f"Function: {fn}"
     )
 
 
-def _assert_master_report_contract(payload: Dict[str, Any]) -> None:
-    # Root keys (minimum expected by schema contract)
-    for k in ["checks", "inputs", "summary"]:
-        assert k in payload, f"Missing root key: {k}"
-    assert "status" in payload or "overall_status" in payload, "Missing root status field(s)"
+def _assert_output_layout(phase2_root: Path, case_id: str) -> None:
+    """
+    Output layout contract:
 
-    # checks shape
-    assert isinstance(payload["checks"], list)
-    for c in payload["checks"]:
-        assert isinstance(c, dict)
-        assert "id" in c
-        assert "status" in c
+      Required:
+        - <phase2_root>/<case_id>/report.json
 
-    # inputs metadata-only (no 'data' blobs)
-    assert isinstance(payload["inputs"], dict)
-    for doc_type, meta in payload["inputs"].items():
-        assert isinstance(doc_type, str)
-        assert isinstance(meta, dict)
-        assert "data" not in meta, f"inputs[{doc_type}] must be metadata-only (found 'data')"
+      Optional:
+        - <phase2_root>/<case_id>/reports/*.json
 
-    # overall_status contract: must be one of allowed
-    allowed = {"OK", "WARN", "FAIL", "MISSING"}
-    if "overall_status" in payload:
-        assert payload["overall_status"] in allowed
-    if "status" in payload:
-        assert payload["status"] in allowed
+      Forbidden:
+        - any other *.json under <phase2_root>/<case_id>, outside report.json and reports/*.json
+    """
+    case_dir = phase2_root / case_id
+    assert case_dir.exists(), f"Expected case dir to exist: {case_dir}"
+
+    required = case_dir / "report.json"
+    assert required.exists(), f"Expected canonical report.json at {required}"
+
+    all_json = sorted(case_dir.rglob("*.json"))
+
+    allowed: set[Path] = {required}
+
+    reports_dir = case_dir / "reports"
+    if reports_dir.exists():
+        for p in sorted(reports_dir.glob("*.json")):
+            allowed.add(p)
+
+    forbidden = [p for p in all_json if p not in allowed]
+    assert not forbidden, (
+        "Output layout violation: found unexpected JSON files under phase2/<case_id>.\n"
+        "Allowed:\n"
+        f"  - {required.relative_to(case_dir)}\n"
+        "  - reports/*.json (optional)\n"
+        "Forbidden found:\n"
+        + "\n".join([f"  - {p.relative_to(case_dir)}" for p in forbidden])
+    )
 
 
 @pytest.mark.parametrize(
     "scenario, phase1_docs",
     [
         (
-            "holerite_only",
+            "gate1_minimal",
+            [
+                ("proposta_daycoval", "p1.json", {"nome_financiado": "JOAO DA SILVA", "data_nascimento": "01/01/1990"}),
+                ("cnh", "c1.json", {"nome": "JOAO SILVA", "data_nascimento": "01/01/1990"}),
+            ],
+        ),
+        (
+            "income_only",
             [
                 ("holerite", "h1.json", {"salario_liquido": 5000}),
             ],
         ),
         (
-            "extrato_only",
-            [
-                ("extrato_bancario", "e1.json", {"total_entradas": 5800, "total_saidas": 4294}),
-            ],
-        ),
-        (
-            "holerite_and_extrato",
-            [
-                ("holerite", "h1.json", {"salario_liquido": 5000}),
-                ("extrato_bancario", "e1.json", {"total_entradas": 5800, "total_saidas": 4294}),
-            ],
-        ),
-        (
-            "no_income_docs",
+            "empty_phase1",
             [],
         ),
     ],
 )
-def test_phase2_runner_income_writes_report_and_does_not_block(tmp_path: Path, scenario: str, phase1_docs: list) -> None:
+def test_phase2_runner_output_layout_contract(tmp_path: Path, scenario: str, phase1_docs: list) -> None:
     """
-    Contract (runner canônico):
-      - Runner must not block/raise
-      - Must write: <phase2_root>/<case_id>/report.json
-      - Report must satisfy master_report contracts (schema/status/inputs/overall_status)
+    This is a pure output-layout contract.
+    It does NOT validate business semantics beyond the existence of report.json and layout constraints.
 
-    We intentionally do NOT require optional docs: absence must be represented as MISSING/WARN/OK per contracts.
+    Must remain stable even as we add new checks or legacy reports.
     """
     storage_root = tmp_path / "storage"
     phase1_root = storage_root / "phase1"
@@ -198,7 +200,7 @@ def test_phase2_runner_income_writes_report_and_does_not_block(tmp_path: Path, s
     phase1_root.mkdir(parents=True, exist_ok=True)
     phase2_root.mkdir(parents=True, exist_ok=True)
 
-    case_id = f"case_runner_income_{scenario}"
+    case_id = f"case_layout_{scenario}"
 
     for doc_type, filename, data in phase1_docs:
         _write_phase1_doc(phase1_root, case_id, doc_type, filename, data)
@@ -208,5 +210,5 @@ def test_phase2_runner_income_writes_report_and_does_not_block(tmp_path: Path, s
     # Must not raise
     _call_runner(fn, case_id, phase1_root=str(phase1_root), phase2_root=str(phase2_root), tmp_path=tmp_path)
 
-    payload = _load_report_json(phase2_root, case_id)
-    _assert_master_report_contract(payload)
+    # Must satisfy layout contract
+    _assert_output_layout(phase2_root, case_id)
