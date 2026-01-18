@@ -1,3 +1,4 @@
+# parsers/detran_sc.py
 from __future__ import annotations
 
 import re
@@ -49,7 +50,7 @@ def analyze_detran_sc(
     """Parser Detran SC.
 
     Contrato (Phase 1):
-      - Retorna dict flat (compatível com testes existentes).
+      - Retorna dict flat.
       - Inclui campos textuais (blocos) para auditoria.
       - Extração best-effort com OCR fallback.
       - Não realiza validações nem inferências cruzadas.
@@ -75,14 +76,25 @@ def analyze_detran_sc(
     # - nome com asteriscos => aberta
     # - caso contrário => despachante
     consulta_eff: Literal["aberta", "despachante"] = (
-        consulta if consulta in {"aberta", "despachante"} else ("aberta" if proprietario_nome_ofuscado else "despachante")
+        consulta
+        if consulta in {"aberta", "despachante"}
+        else ("aberta" if proprietario_nome_ofuscado else "despachante")
     )
 
     # Mantém compatibilidade: em consulta aberta, o nome é considerado ofuscado.
     if consulta_eff == "aberta":
         proprietario_nome_ofuscado = True
 
-    extracted = _extract_fields(lines, proprietario_nome, proprietario_nome_ofuscado)
+    iniciais_tokens = _extract_iniciais_from_ofuscado(proprietario_nome) if proprietario_nome_ofuscado else []
+    proprietario_iniciais = "".join(iniciais_tokens) if iniciais_tokens else None
+
+    extracted = _extract_fields(
+        lines,
+        proprietario_nome,
+        proprietario_nome_ofuscado,
+        proprietario_iniciais,
+        iniciais_tokens,
+    )
 
     pages: List[Dict[str, Any]] = []
     for i in range(max(len(pages_native_len), len(pages_ocr_len))):
@@ -115,7 +127,8 @@ def analyze_detran_sc(
 
 
 def _extract_native_text(path: str) -> Tuple[str, List[int]]:
-    texts, lens = [], []
+    texts: List[str] = []
+    lens: List[int] = []
     if path.lower().endswith(".pdf"):
         import pdfplumber
 
@@ -134,7 +147,8 @@ def _ocr_to_text(path: str, *, dpi: int) -> Tuple[str, List[int]]:
     from PIL import Image
     import pytesseract
 
-    texts, lens = [], []
+    texts: List[str] = []
+    lens: List[int] = []
 
     if path.lower().endswith(".pdf"):
         images = convert_from_path(path, dpi=dpi)
@@ -187,6 +201,24 @@ def _extract_owner_name(lines: List[str]) -> Optional[str]:
             return l.split(":", 1)[-1].strip()
 
     return None
+
+
+def _extract_iniciais_from_ofuscado(name: Optional[str]) -> List[str]:
+    """Extrai iniciais (tokens) a partir de um nome ofuscado.
+
+    Ex.: "J*** S***" -> ["J", "S"]
+         "J****"     -> ["J"]
+    """
+    if not name:
+        return []
+    tokens = [t.strip() for t in re.split(r"\s+", name) if t.strip()]
+    out: List[str] = []
+    for t in tokens:
+        # Aceita formatos como "J***" ou "J*" ou "J***." (com acentos)
+        m = re.match(r"^([A-ZÁÉÍÓÚÂÊÔÃÕÇ])\*+\.?$", t.upper())
+        if m:
+            out.append(m.group(1))
+    return out
 
 
 def _first(rx: re.Pattern, text: str) -> Optional[str]:
@@ -323,6 +355,8 @@ def _extract_fields(
     lines: List[str],
     proprietario_nome: Optional[str],
     proprietario_nome_ofuscado: bool,
+    proprietario_iniciais: Optional[str],
+    proprietario_iniciais_tokens: List[str],
 ) -> Dict[str, Any]:
     blob = " ".join(lines).upper()
 
@@ -383,6 +417,8 @@ def _extract_fields(
 
         "proprietario_nome": proprietario_nome,
         "proprietario_nome_ofuscado": proprietario_nome_ofuscado,
+        "proprietario_iniciais": proprietario_iniciais,
+        "proprietario_iniciais_tokens": proprietario_iniciais_tokens,
         "proprietario_doc": proprietario_doc,
         "proprietario_doc_ofuscado": proprietario_doc_ofuscado,
 
