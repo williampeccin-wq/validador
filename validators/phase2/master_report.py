@@ -1,5 +1,4 @@
 # validators/phase2/master_report.py
-
 from __future__ import annotations
 
 import json
@@ -7,6 +6,8 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+from validators.phase2.proposta_cnh_senatran_validator import build_proposta_cnh_senatran_checks
 
 # MUST match tests/test_phase2_master_report_meta_contract.py::SCHEMA_VERSION
 SCHEMA_VERSION = "phase2.master_report@1"
@@ -55,7 +56,14 @@ def _looks_like_phase1_case_root(p: Path) -> bool:
     if not p.exists() or not p.is_dir():
         return False
     # Common Phase1 doc_type dirs:
-    for d in ("proposta_daycoval", "cnh", "holerite", "extrato_bancario", "comprovante_renda"):
+    for d in (
+        "proposta_daycoval",
+        "cnh",
+        "cnh_senatran",
+        "holerite",
+        "extrato_bancario",
+        "comprovante_renda",
+    ):
         if (p / d).exists():
             return True
     return False
@@ -389,6 +397,26 @@ def _build_income_checks(phase1_case_root: Path, presence: Dict[str, Dict[str, A
     return [min_chk, proof_chk, total_chk]
 
 
+def _build_cnh_senatran_checks_if_present(phase1_case_root: Path, presence: Dict[str, Dict[str, Any]], *, case_id: str) -> List[Dict[str, Any]]:
+    """
+    Importante (não-regressão):
+      - Só gera checks novos se cnh_senatran estiver PRESENTE no Phase1.
+      - Não altera Gate1.
+    """
+    has_senatran = bool((presence.get("cnh_senatran") or {}).get("present"))
+    if not has_senatran:
+        return []
+
+    proposta, _ = _read_phase1_latest_data(phase1_case_root, "proposta_daycoval")
+    cnh_senatran, _ = _read_phase1_latest_data(phase1_case_root, "cnh_senatran")
+
+    return build_proposta_cnh_senatran_checks(
+        case_id=case_id,
+        proposta_data=proposta or {},
+        cnh_senatran_data=cnh_senatran or {},
+    )
+
+
 def _ensure_unique_check_ids(checks: List[Dict[str, Any]]) -> None:
     seen = set()
     for c in checks:
@@ -428,6 +456,10 @@ def build_master_report(case_id: str, *, phase1_root: Union[str, Path], phase2_r
     checks: List[Dict[str, Any]] = []
     checks.append(_build_identity_check(phase1_case_root, presence))
     checks.extend(_build_income_checks(phase1_case_root, presence))
+
+    # NEW (non-regression): only when cnh_senatran exists
+    checks.extend(_build_cnh_senatran_checks_if_present(phase1_case_root, presence, case_id=case_id))
+
     _ensure_unique_check_ids(checks)
 
     overall = _compute_overall_status(checks)
