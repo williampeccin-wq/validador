@@ -1,0 +1,13 @@
+{
+  "nome": null,
+  "cpf": "08600995981",
+  "data_nascimento": "04/09/1994",
+  "cidade_nascimento": "Sespdc",
+  "uf_nascimento": "SC",
+  "validade": "27/02/2034",
+  "filiacao": [
+    "FILIACAO MAE",
+    "ADRIANE NUNES DA SILVA"
+  ],
+  "categoria": null
+}
