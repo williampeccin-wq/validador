@@ -437,6 +437,78 @@ def collect_document(
                 filename=raw.filename,
             )
 
+            # 2b) Retry inteligente (CNH / Proposta): se ha texto nativo mas
+            # os campos minimos nao foram extraidos, forca OCR e tenta de novo.
+            # Isso evita depender de PHASE1_ENABLE_OCR para documentos que
+            # frequentemente trazem apenas o cabecalho no texto nativo.
+            try:
+                def _missing_fields_for_retry(dt_: DocumentType, fields: Optional[Dict[str, Any]]) -> List[str]:
+                    if not fields or not isinstance(fields, dict):
+                        return []
+                    if dt_ == DocumentType.CNH:
+                        miss = []
+                        if not fields.get("nome"):
+                            miss.append("nome")
+                        if not fields.get("data_nascimento"):
+                            miss.append("data_nascimento")
+                        return miss
+                    if dt_ == DocumentType.PROPOSTA_DAYCOVAL:
+                        miss = []
+                        # contrato minimo para Phase2 (renda) e identidade
+                        if not fields.get("nome_financiado") and not fields.get("nome"):
+                            miss.append("nome_financiado")
+                        if not fields.get("data_nascimento"):
+                            miss.append("data_nascimento")
+                        # renda declarada pode existir como salario/outras_rendas
+                        if fields.get("salario") is None and fields.get("outras_rendas") is None:
+                            miss.append("renda_declarada")
+                        return miss
+                    return []
+
+                missing_for_retry = _missing_fields_for_retry(dt, parsed)
+                if missing_for_retry:
+                    raw_text_ocr, extractor_debug_ocr = _extract_text_phase1(
+                        file_path,
+                        raw,
+                        force_ocr=True,
+                    )
+                    parsed_ocr, parser_debug_ocr = _invoke_parser(
+                        parser,
+                        file_path=file_path,
+                        raw_text=raw_text_ocr or "",
+                        filename=raw.filename,
+                    )
+
+                    # Aceita retry apenas se melhorou algo (evita degradacao).
+                    missing_after = _missing_fields_for_retry(dt, parsed_ocr)
+                    improved = len(missing_after) < len(missing_for_retry)
+
+                    if improved:
+                        parsed = parsed_ocr
+                        parser_debug = parser_debug_ocr
+                        extractor_debug = {
+                            "native_first": extractor_debug,
+                            "ocr_retry": extractor_debug_ocr,
+                            "ocr_retry_used": True,
+                            "missing_before": missing_for_retry,
+                            "missing_after": missing_after,
+                        }
+                    else:
+                        extractor_debug = {
+                            "native_first": extractor_debug,
+                            "ocr_retry": extractor_debug_ocr,
+                            "ocr_retry_used": False,
+                            "missing_before": missing_for_retry,
+                            "missing_after": missing_after,
+                        }
+            except Exception as _retry_e:
+                # Nao quebra: apenas anexa debug
+                extractor_debug = extractor_debug or {}
+                extractor_debug = {
+                    "native_first": extractor_debug,
+                    "ocr_retry_error": f"{type(_retry_e).__name__}: {_retry_e}",
+                }
+
             # 3) se parser retornou warning/error, promover para parse_error (sem quebrar)
             if parser_debug and ("error" in parser_debug):
                 parse_error = {

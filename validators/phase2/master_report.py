@@ -275,18 +275,51 @@ def _build_identity_check(phase1_case_root: Path, presence: Dict[str, Dict[str, 
     proposta_dn = norm(proposta.get("data_nascimento"))
     cnh_dn = norm(cnh.get("data_nascimento"))
 
-    ok = True
+    # IMPORTANT: não marcar OK se não houver campos mínimos comparáveis.
+    # Caso clássico: CNH coletada mas parsing falhou (campos None).
+    required_fields = ["nome", "data_nascimento"]
+    present = {
+        "proposta_daycoval": {
+            "nome": bool(proposta_nome),
+            "data_nascimento": bool(proposta_dn),
+        },
+        "cnh": {
+            "nome": bool(cnh_nome),
+            "data_nascimento": bool(cnh_dn),
+        },
+    }
+
+    missing_fields: List[str] = []
+    if not proposta_nome:
+        missing_fields.append("proposta_daycoval.nome")
+    if not proposta_dn:
+        missing_fields.append("proposta_daycoval.data_nascimento")
+    if not cnh_nome:
+        missing_fields.append("cnh.nome")
+    if not cnh_dn:
+        missing_fields.append("cnh.data_nascimento")
+
+    if missing_fields:
+        return _mk_check(
+            check_id="identity.proposta_vs_cnh",
+            status="MISSING",
+            message="Missing required identity fields",
+            evidence={
+                "fields_compared": required_fields,
+                "missing_fields": missing_fields,
+                "present": present,
+            },
+        )
+
     diffs: Dict[str, Any] = {}
 
-    if proposta_nome and cnh_nome and proposta_nome != cnh_nome:
-        ok = False
-        diffs["nome"] = {"proposta": proposta_nome, "cnh": cnh_nome}
+    if proposta_nome != cnh_nome:
+        diffs["nome"] = True
 
-    if proposta_dn and cnh_dn and proposta_dn != cnh_dn:
-        ok = False
-        diffs["data_nascimento"] = {"proposta": proposta_dn, "cnh": cnh_dn}
+    if proposta_dn != cnh_dn:
+        diffs["data_nascimento"] = True
 
-    if ok:
+    if not diffs:
         return _mk_check(
             check_id="identity.proposta_vs_cnh",
             status="OK",

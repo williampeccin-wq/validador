@@ -1,143 +1,130 @@
-# orchestrator/phase2_runner.py
-
 from __future__ import annotations
 
 import json
+import traceback
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Dict, Optional
 
-from validators.phase2.master_report import build_master_report_and_return_path
+from validators.phase2.master_report import build_master_report, build_master_report_and_return_path
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _default_phase1_root() -> Path:
+    # storage/phase1
+    return Path("storage") / "phase1"
+
+
+def _default_phase2_root() -> Path:
+    # storage/phase2
+    return Path("storage") / "phase2"
 
 
 @dataclass(frozen=True)
 class Phase2RunResult:
-    """
-    Return type is intentionally lightweight. Tests care about side-effect (report.json) and non-blocking behavior.
-    """
-    case_id: str
-    report_path: str
     ok: bool
-    error: Optional[str] = None
+    report_path: Optional[Path]
+    error: Optional[Dict[str, Any]]
 
 
-def _normalize_storage_roots(
-    *,
+def build_master_report_and_return_path_compat(
     case_id: str,
-    phase1_root: Optional[Union[str, Path]] = None,
-    phase2_root: Optional[Union[str, Path]] = None,
-    storage_root: Optional[Union[str, Path]] = None,
-) -> tuple[str, str]:
+    *,
+    phase1_root: str | Path | None = None,
+    phase2_root: str | Path | None = None,
+    write_report: bool = True,
+) -> Path:
     """
-    Support multiple call styles used by contract tests:
-      - run_phase2(case_id, phase1_root=".../phase1", phase2_root=".../phase2", ...)
-      - run_phase2(case_id, storage_root=".../storage", ...)
-      - run_phase2(case_id) assuming CWD has storage/phase1 and storage/phase2
-
-    Returns (phase1_root_str, phase2_root_str) pointing to the PHASE roots (not case_id dirs).
+    Compat layer:
+    - O master_report.py atual NÃO aceita 'write_report' (sempre escreve).
+    - Mantemos o parâmetro aqui para compatibilidade com UI/integrações,
+      mas garantimos que não exploda (não repassamos para a função).
     """
-    if storage_root is not None:
-        sr = Path(storage_root)
-        return str(sr / "phase1"), str(sr / "phase2")
+    p1 = Path(phase1_root) if phase1_root is not None else _default_phase1_root()
+    p2 = Path(phase2_root) if phase2_root is not None else _default_phase2_root()
 
-    p1 = Path(phase1_root) if phase1_root is not None else Path("storage/phase1")
-    p2 = Path(phase2_root) if phase2_root is not None else Path("storage/phase2")
-    return str(p1), str(p2)
+    # Se write_report=False, ainda assim precisamos de um artefato para UI/trace.
+    # Para manter comportamento previsível, seguimos escrevendo (sem quebrar).
+    _ = write_report  # intencional: compat
+
+    return build_master_report_and_return_path(case_id, phase1_root=p1, phase2_root=p2)
 
 
 def run_phase2(
     case_id: str,
     *,
-    phase1_root: str = "storage/phase1",
-    phase2_root: str = "storage/phase2",
-    storage_root: Optional[Union[str, Path]] = None,
+    phase1_root: str | Path | None = None,
+    phase2_root: str | Path | None = None,
     write_report: bool = True,
 ) -> Phase2RunResult:
     """
-    Phase 2 canonical runner contract:
-      - MUST NOT raise (non-blocking)
-      - MUST write: <phase2_root>/<case_id>/report.json when write_report=True
-      - MUST be callable via multiple compatible signatures (tests probe variants)
-      - Must keep validations cross-document out of parsing/collection time (Phase 2 runs after collection)
+    Executa Phase 2 e retorna o path do report.json.
 
-    Important:
-      The contract tests treat ANY TypeError as a signature mismatch, because they catch TypeError to try other call styles.
-      Therefore, this function MUST NOT let a TypeError escape (or any exception, really).
+    Importante (diretriz do projeto):
+    - Se houver erro interno, NÃO bloquear o fluxo inteiro.
+    - Retornar ok=False + erro, mas tentar escrever um report mínimo quando possível.
     """
-    p1_root, p2_root = _normalize_storage_roots(
-        case_id=case_id,
-        phase1_root=phase1_root,
-        phase2_root=phase2_root,
-        storage_root=storage_root,
-    )
-
-    # Default success assumption; flip on exception.
-    ok = True
-    err: Optional[str] = None
-
-    # We always compute the expected report path, even if write_report=False.
-    report_path = str(Path(p2_root) / case_id / "report.json")
+    p1 = Path(phase1_root) if phase1_root is not None else _default_phase1_root()
+    p2 = Path(phase2_root) if phase2_root is not None else _default_phase2_root()
 
     try:
-        if write_report:
-            report_path = build_master_report_and_return_path(
-                case_id=case_id,
-                phase1_root=p1_root,
-                phase2_root=p2_root,
-                write_report=True,
-            )
-        else:
-            # Still build to validate contracts, but avoid writing.
-            # build_master_report_and_return_path supports write_report flag.
-            report_path = build_master_report_and_return_path(
-                case_id=case_id,
-                phase1_root=p1_root,
-                phase2_root=p2_root,
-                write_report=False,
-            )
+        report_path = build_master_report_and_return_path_compat(
+            case_id,
+            phase1_root=p1,
+            phase2_root=p2,
+            write_report=write_report,
+        )
+        return Phase2RunResult(ok=True, report_path=report_path, error=None)
 
     except Exception as e:
-        # Non-blocking fallback:
-        # Write a minimal report.json that still respects core layout contract, so tests can proceed.
-        ok = False
-        err = f"{type(e).__name__}: {e}"
+        err = {
+            "message": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc(),
+            "created_at": _utc_now_iso(),
+        }
 
-        try:
-            out_dir = Path(p2_root) / case_id
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / "report.json"
-
-            minimal = {
-                "checks": [
-                    {
-                        "id": "phase2.runner.error",
-                        "status": "WARN",
-                        "title": "Runner error",
-                        "explain": "Phase 2 runner captured an internal error but did not block.",
-                        "details": {"error": err},
-                    }
-                ],
-                "inputs": {"docs": {}},
-                "summary": {"overall_status": "WARN", "counts": {"OK": 0, "WARN": 1, "FAIL": 0, "MISSING": 0}, "total_checks": 1},
+        # Report mínimo, para a UI não quebrar e para diagnóstico
+        # (e para respeitar a regra: não bloquear durante parsing/extracão).
+        minimal = {
+            "schema": "phase2.master_report.v1",
+            "schema_version": "v1",
+            "validator": "phase2.master_report",
+            "created_at": _utc_now_iso(),
+            "meta": {
+                "case_id": case_id,
+                "created_at": _utc_now_iso(),
+                "schema": "phase2.master_report.v1",
+                "schema_version": "v1",
+                "validator": "phase2.master_report",
+                "gate1_status": "FAIL",
+                "inputs": {},
+            },
+            "inputs": {"docs": {}},
+            "checks": [
+                {
+                    "id": "phase2.runner.error",
+                    "title": "Runner error",
+                    "status": "WARN",
+                    "explain": "Phase 2 runner captured an internal error but did not block.",
+                    "details": {"error": err["message"]},
+                }
+            ],
+            "summary": {
                 "overall_status": "WARN",
-                "status": "WARN",
-                "meta": {
-                    "schema_version": "v1",
-                    "validator": "phase2.master_report",
-                    "schema": "phase2.master_report.v1",
-                    "created_at": "1970-01-01T00:00:00Z",
-                    "case_id": case_id,
-                    "gate1_status": "FAIL",
-                    "inputs": {},
-                },
-            }
+                "counts": {"OK": 0, "WARN": 1, "FAIL": 0, "MISSING": 0},
+                "total_checks": 1,
+            },
+            "overall_status": "WARN",
+            "status": "WARN",
+        }
 
-            out_path.write_text(json.dumps(minimal, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
-            report_path = str(out_path)
+        out_dir = p2 / case_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "report.json"
+        out_path.write_text(json.dumps(minimal, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        except Exception as e2:
-            # Even fallback failed: still must not raise.
-            ok = False
-            err = f"{err} | fallback_failed: {type(e2).__name__}: {e2}"
-
-    return Phase2RunResult(case_id=case_id, report_path=report_path, ok=ok, error=err)
+        return Phase2RunResult(ok=False, report_path=out_path, error=err)

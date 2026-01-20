@@ -12,3 +12,4 @@ tests/fixtures_private/
 
 # Runtime artifacts
 storage/
+.ui_tmp_uploads/

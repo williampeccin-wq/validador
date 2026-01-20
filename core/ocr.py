@@ -2,9 +2,13 @@ import os
 import re
 import tempfile
 import subprocess
-from typing import Tuple, Dict, Any, Optional, List
+from typing import Tuple, Dict, Any, List
+
 from PIL import Image, ImageOps, ImageEnhance
-import pytesseract
+
+# OCR deps (pytesseract) sao opcionais em alguns ambientes.
+# Ao manter o import lazy, evitamos quebrar a aplicacao inteira quando
+# o usuario ainda nao instalou dependencias de OCR.
 
 
 def normalize_text(s: str) -> str:
@@ -32,13 +36,23 @@ def diagnose_environment(tesseract_cmd: str, poppler_path: str) -> Dict[str, Any
     except Exception as e:
         diag["pdfplumber"] = f"ausente/erro: {type(e).__name__}: {e}"
 
-    # tesseract
+    # pytesseract (opcional) + tesseract
     try:
+        import importlib.metadata as _md
+        import pytesseract  # type: ignore
+
+        diag["pytesseract"] = f"ok: {_md.version('pytesseract')}"
         pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
         v = subprocess.check_output([tesseract_cmd, "--version"], text=True, stderr=subprocess.STDOUT)
         diag["tesseract_version"] = v.strip()
     except Exception as e:
-        diag["tesseract_version"] = f"erro: {type(e).__name__}: {e}"
+        diag["pytesseract"] = f"ausente/erro: {type(e).__name__}: {e}"
+        # Mesmo sem pytesseract, tentar ao menos confirmar o binario.
+        try:
+            v = subprocess.check_output([tesseract_cmd, "--version"], text=True, stderr=subprocess.STDOUT)
+            diag["tesseract_version"] = v.strip()
+        except Exception as e2:
+            diag["tesseract_version"] = f"erro: {type(e2).__name__}: {e2}"
 
     # pdftoppm
     try:
@@ -73,7 +87,30 @@ def extract_text_any(
         "ocr_retry": False,
     }
 
-    pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    # OCR deps podem nao estar instalados; manter a aplicacao viva e
+    # retornar debug claro.
+    try:
+        import pytesseract  # type: ignore
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+    except Exception as e:
+        # Sem pytesseract nao ha OCR. Ainda assim, tentamos texto nativo (PDF).
+        if fn.endswith(".pdf"):
+            text, dbg_pdf = _extract_pdf_text(
+                pdf_bytes=file_bytes,
+                poppler_path=poppler_path,
+                min_text_len_threshold=min_text_len_threshold,
+                ocr_dpi=ocr_dpi,
+                ocr_available=False,
+                ocr_unavailable_error=f"{type(e).__name__}: {e}",
+            )
+            dbg.update(dbg_pdf)
+            dbg["text_len"] = len(text or "")
+            return normalize_text(text), dbg
+
+        dbg["debug_src"] = "ocr_unavailable"
+        dbg["text_len"] = 0
+        dbg["ocr_error"] = f"{type(e).__name__}: {e}"
+        return "", dbg
 
     if fn.endswith(".pdf"):
         text, dbg_pdf = _extract_pdf_text(
@@ -81,6 +118,8 @@ def extract_text_any(
             poppler_path=poppler_path,
             min_text_len_threshold=min_text_len_threshold,
             ocr_dpi=ocr_dpi,
+            ocr_available=True,
+            ocr_unavailable_error=None,
         )
         dbg.update(dbg_pdf)
         dbg["text_len"] = len(text or "")
@@ -98,6 +137,8 @@ def _extract_pdf_text(
     poppler_path: str,
     min_text_len_threshold: int,
     ocr_dpi: int,
+    ocr_available: bool,
+    ocr_unavailable_error: str | None,
 ) -> Tuple[str, Dict[str, Any]]:
     dbg: Dict[str, Any] = {
         "debug_src": "pdfplumber",
@@ -130,6 +171,14 @@ def _extract_pdf_text(
         return text_plumber, dbg
 
     # 2) OCR do PDF
+    if not ocr_available:
+        dbg["debug_src"] = "pdf_native_only"
+        dbg["ocr_retry"] = False
+        if ocr_unavailable_error:
+            dbg["ocr_error"] = ocr_unavailable_error
+        return text_plumber, dbg
+
+    # OCR disponivel
     dbg["debug_src"] = "pdf_ocr"
     dbg["ocr_retry"] = True
 
@@ -275,7 +324,8 @@ def _ocr_image(img: Image.Image) -> str:
     # Config: psm 6 (blocos) funciona melhor em CNH digital do que default
     config = "--oem 1 --psm 6"
 
-    # por+eng para pegar PT + rótulos em inglês
+    # por+eng para pegar PT + rotulos em ingles
+    import pytesseract  # type: ignore
     return pytesseract.image_to_string(img2, lang="por+eng", config=config)
 
 
