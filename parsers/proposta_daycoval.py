@@ -1,3 +1,5 @@
+# parsers/proposta_daycoval.py
+
 from __future__ import annotations
 
 import re
@@ -31,6 +33,10 @@ class PropostaDaycovalResult:
     salario: Optional[str] = None
     outras_rendas: Optional[str] = None
     valor_parcela: Optional[str] = None
+
+    # NOVO: Vlr. Compra (valor FIPE do carro no momento da proposta)
+    valor_compra: Optional[str] = None
+
     debug: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -145,12 +151,7 @@ class PropostaDaycovalParser:
                 m_val = re.search(self._VALOR_BR_RE, outras_fb)
                 res.outras_rendas = m_val.group(0) if m_val else None
 
-        # Valor parcela (precisa existir no fixture)
-        # FIX: não pode depender de between("Vlr. Parcela:", "Taxa Nominal") porque o texto varia.
-        # Captura robusta por label (aceita variações e quebras de linha):
-        # - Vlr. Parcela / Vlr Parcela
-        # - Valor da Parcela
-        # - Prestação / Prestacao
+        # Valor parcela (financiamento) - obrigatório no seu contrato
         m_parcela = re.search(
             r"\b(?:Vlr\.?|Valor)\s*(?:da\s*)?(?:Parcela|Prest(?:a[cç][aã]o)?|Presta[cç][aã]o)\b\s*[:\-]?\s*(?:R\$\s*)?("
             + self._VALOR_BR_RE.pattern
@@ -168,6 +169,14 @@ class PropostaDaycovalParser:
                 flags=re.IGNORECASE,
             )
             res.valor_parcela = _norm_spaces(m_parcela2.group(1)) if m_parcela2 else None
+
+        # NOVO: Valor compra (FIPE) - label "Vlr. Compra"
+        m_compra = re.search(
+            r"\bVlr\.?\s*Compra\b\s*[:\-]?\s*(?:R\$\s*)?(" + self._VALOR_BR_RE.pattern + r")\b",
+            t,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        res.valor_compra = _norm_spaces(m_compra.group(1)) if m_compra else None
 
         return res
 
@@ -198,6 +207,3 @@ def analyze_proposta_daycoval(
         return fields, dbg
 
     return fields
-
-
-__all__ = ["analyze_proposta_daycoval", "PropostaDaycovalParser", "PropostaDaycovalResult"]
