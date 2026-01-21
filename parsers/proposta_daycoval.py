@@ -49,15 +49,21 @@ class PropostaDaycovalParser:
     _VALOR_BR_RE = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2}")
 
     # Endereço: separadores típicos de número / complemento (tolerante a "Nº.:35", "Nº:35", "Nº . : 35", etc.)
-    _END_NUM_SPLIT_RE = re.compile(
-        r"(?is)\bN[ºo]\s*\.?\s*(?:\.\s*)?:?\s*(?:\d{1,6})\b"
-    )
+    _END_NUM_SPLIT_RE = re.compile(r"(?is)\bN[ºo]\s*\.?\s*(?:\.\s*)?:?\s*(?:\d{1,6})\b")
     _END_COMP_LABEL_RE = re.compile(r"(?is)\bCompl\.?\s*:")
 
-    # Mãe: captura tolerante a quebra de linha e sobrenome na linha seguinte
+    # Mãe: captura tolerante a quebra de linha e sobrenome na linha seguinte (baseia-se no bloco "Fil.Mãe: ... Qtde")
     _MAE_RE = re.compile(
         r"(?is)\bFil\.?\s*M[ãa]e\s*:\s*(?P<nome>.+?)\s+(?=Qtde\b)",
         flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    _MAE_TAIL_STOP_RE = re.compile(
+        r"(?is)\b("
+        r"Nome\s+C[oô]njuge|Endere[cç]o|Bairro|Cidade\b|UF\b|Cep\b|Telefone|Celular|E-?Mail|"
+        r"ATIVIDADE\s+PROFISSIONAL|Empresa|Sal[aá]rio|Outras\s+Rendas|DADOS\s+DO\s+C[oô]NJUGE|"
+        r"REFER[ÊE]NCIA|DADOS\s+DO\s+AVALISTA|Continua"
+        r")\b"
     )
 
     def parse_text(self, t: str) -> PropostaDaycovalResult:
@@ -120,12 +126,61 @@ class PropostaDaycovalParser:
             res.cidade_nascimento = _norm_spaces(m_nat.group(1)).upper()
             res.uf = _norm_spaces(m_nat.group(2)).upper()
 
-        # Nome da mãe (robusto para multiline)
+        # Nome da mãe (robusto: aceita sobrenome na linha após "Qtde Dependentes: 0")
+        def _looks_like_name_piece(s: str) -> bool:
+            s = _norm_spaces(s).upper()
+            if not s:
+                return False
+            if ":" in s:
+                return False
+            if re.search(r"\d", s):
+                return False
+            if self._MAE_TAIL_STOP_RE.search(s):
+                return False
+            # evita capturar lixo (ex.: siglas longas)
+            if len(s) > 40:
+                return False
+            # apenas letras (com acentos), espaços, hífen e apóstrofo
+            if not re.fullmatch(r"[A-ZÀ-Ü \-']{2,}", s):
+                return False
+            return True
+
         m_mae = self._MAE_RE.search(t)
         if m_mae:
-            mae = _norm_spaces(m_mae.group("nome"))
-            if mae:
-                res.nome_mae = mae.upper()
+            mae_base = _norm_spaces(m_mae.group("nome")).upper()
+            if mae_base:
+                mae = mae_base
+
+                # olha o "rabo" após o match e tenta capturar um sobrenome isolado na linha seguinte
+                # padrão real visto: "Qtde Dependentes: 0\nLIMA\nNome Cônjuge: ..."
+                tail = t[m_mae.end() :]
+
+                # pega as próximas linhas "cruas"
+                lines = tail.splitlines()
+
+                # percorre poucas linhas para não correr risco
+                for ln in lines[:6]:
+                    s = _norm_spaces(ln).upper()
+                    if not s:
+                        continue
+
+                    # ignorar a linha do Qtde Dependentes inteira
+                    if re.search(r"(?is)\bQtde\b", s) or "DEPENDENTE" in s:
+                        continue
+
+                    # se já bateu em um marcador de próximo bloco, para
+                    if self._MAE_TAIL_STOP_RE.search(s):
+                        break
+
+                    # se for um pedaço de nome plausível (ex.: "LIMA"), agrega e para
+                    if _looks_like_name_piece(s):
+                        mae = _norm_spaces(mae + " " + s).upper()
+                        break
+
+                    # se a linha não parece nome e não é vazia, para para não arriscar
+                    break
+
+                res.nome_mae = mae
 
         # Endereço: ... Cep:
         end = find_first(
