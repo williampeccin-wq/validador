@@ -1,15 +1,18 @@
+# tests/test_cnh_golden.py
+from __future__ import annotations
+
 import json
+import os
 from pathlib import Path
 
 import pytest
 
-# Import do seu contrato público
 from parsers.cnh import analyze_cnh
 
 
 HERE = Path(__file__).resolve().parent
-FIXTURES = HERE / "fixtures"
-GOLDEN = HERE / "golden"
+FIXTURES_DIR = HERE / "fixtures"
+GOLDENS_DIR = HERE / "goldens"
 
 
 def _load_text(path: Path) -> str:
@@ -20,25 +23,71 @@ def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-@pytest.mark.golden
-def test_cnh_golden_from_saved_ocr_text():
+def _write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _analyze(raw_text: str, filename: str) -> tuple[dict, dict]:
     """
-    Teste de regressão (golden):
-    - Entrada: texto OCR salvo
-    - Saída: campos estruturados do contrato
+    Contrato: analyze_cnh retorna (fields, debug)
+    - fields: dict contratual da CNH (congelado pelo golden)
+    - debug : dict auxiliar (não congelado integralmente)
     """
-    raw_text = _load_text(FIXTURES / "cnh_ocr.txt")
-    expected = _load_json(GOLDEN / "cnh_expected.json")
+    res = analyze_cnh(raw_text=raw_text, filename=filename)
+    assert isinstance(res, tuple) and len(res) == 2, "analyze_cnh deve retornar (fields, dbg)"
+    fields, dbg = res
+    assert isinstance(fields, dict), "fields deve ser dict"
+    assert isinstance(dbg, dict), "dbg deve ser dict"
+    return fields, dbg
 
-    fields, dbg = analyze_cnh(raw_text=raw_text, filename="CNH DIGITAL.pdf", use_gemini=False)
 
-    # 1) Garantir presença de chaves do contrato
-    for k in expected.keys():
-        assert k in fields, f"Campo ausente no retorno: {k}"
+@pytest.mark.parametrize(
+    "fixture_txt, expected_json, filename",
+    [
+        # CNH “DIGITAL” (na prática: SENATRAN/SERPRO) — Anderson
+        (
+            FIXTURES_DIR / "cnh_ocr.txt",
+            GOLDENS_DIR / "cnh_expected.json",
+            "CNH DIGITAL.pdf",
+        ),
+        # CNH SENATRAN / Detalhamento — Lucas
+        (
+            FIXTURES_DIR / "cnh_senatran_lucas_ocr.txt",
+            GOLDENS_DIR / "cnh_senatran_lucas_expected.json",
+            "lucasTambreValidCNH.pdf",
+        ),
+    ],
+)
+def test_cnh_golden_from_saved_ocr_text(fixture_txt: Path, expected_json: Path, filename: str):
+    """
+    Teste GOLDEN do DOCUMENTO CNH (Opção A):
 
-    # 2) Comparação exata do payload contratual
-    # (Se um dia você decidir mudar o contrato, você atualiza o expected conscientemente.)
-    assert fields == expected
+    - CNH é UM documento, com UM contrato.
+    - Origem/layout (PDF, app, “CNH DIGITAL”, “Detalhamento”) não cria um novo tipo.
+    - Neste repo, os exemplos são SENATRAN (dbg.mode == "senatran").
+    """
+    assert fixture_txt.exists(), f"Fixture não encontrado: {fixture_txt}"
 
-    # 3) Debug existe (não congelamos conteúdo; só garantimos que é dict)
-    assert isinstance(dbg, dict)
+    raw_text = _load_text(fixture_txt)
+
+    fields, dbg = _analyze(raw_text=raw_text, filename=filename)
+
+    # Regra de arquitetura desta opção:
+    assert dbg.get("mode") == "senatran", f"CNH deve estar em modo senatran. dbg={dbg}"
+
+    # Se quiser atualizar conscientemente o golden:
+    if os.getenv("UPDATE_GOLDEN") == "1":
+        _write_json(expected_json, fields)
+
+    assert expected_json.exists(), (
+        f"Golden não encontrado: {expected_json}\n"
+        f"Rode com UPDATE_GOLDEN=1 para gerar."
+    )
+    expected = _load_json(expected_json)
+
+    # Congela o contrato por igualdade exata
+    assert fields == expected, f"Got={fields} dbg={dbg}"
