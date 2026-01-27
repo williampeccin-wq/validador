@@ -2,142 +2,174 @@
 from __future__ import annotations
 
 import base64
-import hashlib
+import io
 import json
-import mimetypes
 import os
+import re
 import traceback
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple
+
+_STORAGE_ROOT = Path("storage")
 
 
-# ======================================================================================
-# Phase 1 text extraction (NON-BLOCKING)
-#
-# Objetivo: estabilizar a captura.
-# - Sempre persistir o bruto.
-# - Tentar extrair texto e parsear quando possível.
-# - Em qualquer falha de extração/parse, registrar debug e seguir.
-#
-# Nota importante (portabilidade): em ambientes sem Poppler/Tesseract (ex.: CI),
-# OCR pode não estar disponível. Por padrão, a Fase 1 não força OCR; ela usa texto
-# nativo de PDF quando disponível. OCR pode ser habilitado via PHASE1_ENABLE_OCR=1.
-#
-# EXCEÇÃO (decisão A): CNH_SENATRAN força OCR em Phase 1 (sempre), pois é documento
-# imutável/layout fixo e o texto nativo pode ser insuficiente.
-# ======================================================================================
-
-
-# ======================================================================================
-# Storage / config
-# ======================================================================================
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _storage_root() -> Path:
-    """
-    Default: storage/phase1
-    Pode ser sobrescrito por env var PHASE1_STORAGE_ROOT (útil para testes).
-    """
-    return Path(os.getenv("PHASE1_STORAGE_ROOT", "storage/phase1"))
-
-
-def _set_storage_root(storage_root: str | Path) -> None:
-    os.environ["PHASE1_STORAGE_ROOT"] = str(storage_root)
-
-
-def _has_any_json(d: Path) -> bool:
-    return d.exists() and any(p.suffix == ".json" for p in d.iterdir() if p.is_file())
+def _set_storage_root(root: str | Path) -> None:
+    global _STORAGE_ROOT
+    _STORAGE_ROOT = Path(root)
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
-    v = os.getenv(name, default).strip().lower()
-    return v in {"1", "true", "yes", "y", "on"}
+    v = os.getenv(name, default)
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _default_ocr_config() -> Dict[str, Any]:
-    """Defaults compatíveis com o app.py (mas sem depender de Streamlit)."""
     return {
-        "tesseract_cmd": os.getenv("TESSERACT_CMD", "/opt/homebrew/bin/tesseract"),
-        "poppler_path": os.getenv("POPPLER_PATH", "/opt/homebrew/bin"),
-        "min_text_len_threshold": int(os.getenv("PHASE1_MIN_TEXT_LEN_THRESHOLD", "800")),
-        "ocr_dpi": int(os.getenv("PHASE1_OCR_DPI", "350")),
+        "tesseract_cmd": os.getenv("TESSERACT_CMD", ""),
+        "poppler_path": os.getenv("POPPLER_PATH", ""),
+        "min_text_len_threshold": int(os.getenv("OCR_MIN_TEXT_LEN_THRESHOLD", "120")),
+        "ocr_dpi": int(os.getenv("OCR_DPI", "300")),
     }
 
 
-def _extract_text_native_pdf(pdf_bytes: bytes) -> Tuple[str, Dict[str, Any]]:
-    """Extrai texto nativo de PDF via pdfplumber (sem OCR)."""
-    dbg: Dict[str, Any] = {"mode": "native", "pages": None, "native_text_len": 0}
+@dataclass
+class RawPayload:
+    filename: str
+    mime_type: str
+    content_b64: str
+
+
+def _guess_mime_type(filename: str) -> str:
+    fn = (filename or "").lower()
+    if fn.endswith(".pdf"):
+        return "application/pdf"
+    if fn.endswith(".png"):
+        return "image/png"
+    if fn.endswith(".jpg") or fn.endswith(".jpeg"):
+        return "image/jpeg"
+    return "application/octet-stream"
+
+
+def _read_file_as_raw_payload(file_path: str) -> RawPayload:
+    p = Path(file_path)
+    b = p.read_bytes()
+    return RawPayload(
+        filename=p.name,
+        mime_type=_guess_mime_type(p.name),
+        content_b64=base64.b64encode(b).decode("ascii"),
+    )
+
+
+def _phase1_case_dir(case_id: str) -> Path:
+    return _STORAGE_ROOT / "phase1" / case_id
+
+
+def _phase1_doc_dir(case_id: str, dt: "DocumentType") -> Path:
+    return _phase1_case_dir(case_id) / dt.value
+
+
+def _ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def start_case(storage_root: str | Path | None = None) -> str:
+    if storage_root is not None:
+        _set_storage_root(storage_root)
+    case_id = str(uuid.uuid4())
+    _ensure_dir(_phase1_case_dir(case_id))
+    return case_id
+
+
+# ======================================================================================
+# Document types
+# ======================================================================================
+class DocumentType(str, Enum):
+    PROPOSTA_DAYCOVAL = "proposta_daycoval"
+    CNH = "cnh"
+
+    # Mantido por compat, mas na etapa CNH você já decidiu ignorar “validação”
+    CNH_SENATRAN = "cnh_senatran"
+
+    HOLERITE = "holerite"
+    FOLHA = "folha"
+    EXTRATO_BANCARIO = "extrato_bancario"
+
+
+OPTIONAL_DOCS = {DocumentType.HOLERITE, DocumentType.FOLHA, DocumentType.EXTRATO_BANCARIO}
+
+
+def _load_parser_for(dt: DocumentType):
+    if dt == DocumentType.PROPOSTA_DAYCOVAL:
+        from parsers.proposta_daycoval import analyze_proposta_daycoval
+
+        return analyze_proposta_daycoval
+    if dt in (DocumentType.CNH, DocumentType.CNH_SENATRAN):
+        from parsers.cnh import analyze_cnh
+
+        return analyze_cnh
+    if dt == DocumentType.HOLERITE:
+        from parsers.holerite import analyze_holerite
+
+        return analyze_holerite
+    if dt == DocumentType.FOLHA:
+        from parsers.folha import analyze_folha
+
+        return analyze_folha
+    if dt == DocumentType.EXTRATO_BANCARIO:
+        from parsers.extrato_bancario import analyze_extrato_bancario
+
+        return analyze_extrato_bancario
+    return None
+
+
+def _invoke_parser(parser_fn, *, raw_text: str, filename: str) -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None, Dict[str, Any] | None]:
     try:
-        import io
-        import pdfplumber
-
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            dbg["pages"] = len(pdf.pages)
-            out: List[str] = []
-            for p in pdf.pages:
-                out.append(p.extract_text() or "")
-            text = "\n".join(out).strip()
-            dbg["native_text_len"] = len(text)
-            return text, dbg
-    except Exception as e:
-        dbg["error"] = f"{type(e).__name__}: {e}"
-        return "", dbg
-
-
-def _extract_text_phase1(
-    file_path: str,
-    raw: "RawPayload",
-    *,
-    force_ocr: bool = False,
-) -> Tuple[str, Dict[str, Any]]:
-    """
-    Extrai texto de forma não-bloqueante.
-
-    Regra:
-      - Por padrão, usa somente texto nativo de PDF.
-      - OCR só roda se PHASE1_ENABLE_OCR=1.
-      - Se force_ocr=True: OCR roda mesmo que PHASE1_ENABLE_OCR=0.
-    """
-    enable_ocr = _env_truthy("PHASE1_ENABLE_OCR", default="0") or bool(force_ocr)
-
-    # PDF: texto nativo primeiro (portável)
-    if (raw.mime_type or "").lower() == "application/pdf" or raw.filename.lower().endswith(".pdf"):
-        native_text, dbg_native = _extract_text_native_pdf(base64.b64decode(raw.content_b64))
-        if native_text and not force_ocr:
-            return native_text, {"extractor": dbg_native, "ocr": None}
-
-        if not enable_ocr:
-            return native_text, {"extractor": dbg_native, "ocr": None}
-
-        # OCR (habilitado ou forçado)
-        ocr_cfg = _default_ocr_config()
         try:
-            from core.ocr import extract_text_any
+            fields, p_dbg = parser_fn(raw_text=raw_text, filename=filename)
+        except TypeError:
+            fields = parser_fn(raw_text)
+            p_dbg = {}
+        return (fields or {}), (p_dbg or {}), None
+    except Exception as e:
+        err = {
+            "type": "ParserError",
+            "message": f"{type(e).__name__}: {e}",
+            "traceback": traceback.format_exc(),
+        }
+        return None, {"error": err["message"], "traceback": err["traceback"]}, err
 
-            text, dbg = extract_text_any(
-                file_bytes=base64.b64decode(raw.content_b64),
-                filename=raw.filename,
-                tesseract_cmd=ocr_cfg["tesseract_cmd"],
-                poppler_path=ocr_cfg["poppler_path"],
-                min_text_len_threshold=int(ocr_cfg["min_text_len_threshold"]),
-                ocr_dpi=int(ocr_cfg["ocr_dpi"]),
-            )
-            return (text or ""), {"extractor": dbg_native, "ocr": dbg, "force_ocr": bool(force_ocr)}
-        except Exception as e:
-            return native_text, {
-                "extractor": dbg_native,
-                "ocr": {"error": f"{type(e).__name__}: {e}", "enabled": True, "forced": bool(force_ocr)},
-                "force_ocr": bool(force_ocr),
-            }
 
-    # Imagem: OCR somente se habilitado/forçado
+# ======================================================================================
+# Text extraction
+# ======================================================================================
+def _extract_text_phase1(file_path: str, raw: RawPayload, *, force_ocr: bool = False) -> Tuple[str, Dict[str, Any]]:
+    """
+    Best-effort:
+    - tenta nativo (PDF)
+    - OCR só se PHASE1_ENABLE_OCR=1 ou force_ocr=True
+    """
+    native_text = ""
+    native_dbg: Dict[str, Any] = {"ok": False}
+
+    try:
+        from core.pdf_text import extract_pdf_text_native
+
+        if raw.mime_type == "application/pdf":
+            pdf_bytes = base64.b64decode(raw.content_b64)
+            native_text = (extract_pdf_text_native(pdf_bytes) or "").strip()
+            if not force_ocr:
+                min_len = int(os.getenv("PHASE1_MIN_NATIVE_TEXT_LEN", "200"))
+                if len(native_text) >= min_len:
+                    return native_text, {"extractor": {"mode": "pdf_native"}, "native_text_len": len(native_text), "force_ocr": bool(force_ocr)}
+            native_dbg = {"ok": True, "native_text_len": len(native_text)}
+    except Exception as e:
+        native_dbg = {"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
+
+    enable_ocr = _env_truthy("PHASE1_ENABLE_OCR", default="0") or force_ocr
     if enable_ocr:
         ocr_cfg = _default_ocr_config()
         try:
@@ -146,231 +178,190 @@ def _extract_text_phase1(
             text, dbg = extract_text_any(
                 file_bytes=base64.b64decode(raw.content_b64),
                 filename=raw.filename,
-                tesseract_cmd=ocr_cfg["tesseract_cmd"],
-                poppler_path=ocr_cfg["poppler_path"],
-                min_text_len_threshold=int(ocr_cfg["min_text_len_threshold"]),
-                ocr_dpi=int(ocr_cfg["ocr_dpi"]),
+                tesseract_cmd=str(ocr_cfg.get("tesseract_cmd") or ""),
+                poppler_path=str(ocr_cfg.get("poppler_path") or ""),
+                min_text_len_threshold=int(ocr_cfg.get("min_text_len_threshold") or 120),
+                ocr_dpi=int(ocr_cfg.get("ocr_dpi") or 300),
             )
-            return (text or ""), {"extractor": {"mode": "image_ocr"}, "ocr": dbg, "force_ocr": bool(force_ocr)}
+            return (text or ""), {"extractor": {"mode": "ocr"}, "native": native_dbg, "ocr": dbg, "force_ocr": bool(force_ocr)}
         except Exception as e:
-            return "", {"extractor": {"mode": "image_ocr"}, "ocr": {"error": f"{type(e).__name__}: {e}"}, "force_ocr": bool(force_ocr)}
+            return "", {"extractor": {"mode": "ocr"}, "native": native_dbg, "ocr": {"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}, "force_ocr": bool(force_ocr)}
 
-    return "", {"extractor": {"mode": "none", "reason": "ocr_disabled"}, "ocr": None, "force_ocr": bool(force_ocr)}
-
-
-# ======================================================================================
-# Document types
-# ======================================================================================
-
-class DocumentType(str, Enum):
-    # Gate 1
-    PROPOSTA_DAYCOVAL = "proposta_daycoval"
-    CNH = "cnh"
-
-    # CNH SENATRAN (layout fixo / documento imutável)
-    CNH_SENATRAN = "cnh_senatran"
-
-    # Opcionais na Fase 1 (não alteram Gate 1)
-    HOLERITE = "holerite"
-    FOLHA_PAGAMENTO = "folha_pagamento"
-    EXTRATO_BANCARIO = "extrato_bancario"
+    return native_text or "", {"extractor": {"mode": "native_only"}, "native": native_dbg, "ocr": None, "force_ocr": bool(force_ocr)}
 
 
-OPTIONAL_DOCS: set[DocumentType] = {
-    DocumentType.HOLERITE,
-    DocumentType.FOLHA_PAGAMENTO,
-    DocumentType.EXTRATO_BANCARIO,
-}
-
-
-# ======================================================================================
-# CaseStatus (contrato esperado pelos testes)
-# ======================================================================================
-
-@dataclass(frozen=True)
-class CaseStatus:
-    case_id: str
-
-    # Gate 1 inventory
-    has_proposta_daycoval: bool
-    has_cnh: bool
-
-    # Gate 1 control
-    gate1_ready: bool
-    is_complete: bool
-
-    # Gate 1 missing (EXPLÍCITO NOS TESTES)
-    missing: List[str]
-
-    # Opcionais (informativo)
-    has_holerite: bool
-    has_folha_pagamento: bool
-    has_extrato_bancario: bool
-
-    # Inventário bruto
-    types: Dict[str, List[str]]
-
-
-# ======================================================================================
-# Parser loading (não bloqueante e SEM importar tudo)
-# ======================================================================================
-
-ParserFn = Callable[..., Any]
-
-
-def _parser_specs() -> Dict[DocumentType, Tuple[str, str]]:
+def _extract_text_cnh_best(file_path: str, raw: RawPayload, *, analyze_cnh_fn=None) -> Tuple[str, Dict[str, Any]]:
     """
-    Mapeia document_type -> (module, function)
-    Importamos somente o parser do tipo solicitado, para evitar travamentos.
+    CNH: sempre OCR (multipass + fallback).
+    Mesmo que parser esteja indisponível, ainda retorna o melhor por heurística (len/tokens).
     """
-    return {
-        DocumentType.PROPOSTA_DAYCOVAL: ("parsers.proposta_daycoval", "analyze_proposta_daycoval"),
-        DocumentType.CNH: ("parsers.cnh", "analyze_cnh"),
-        DocumentType.CNH_SENATRAN: ("parsers.cnh_senatran", "analyze_cnh_senatran"),
-        DocumentType.HOLERITE: ("parsers.holerite", "analyze_holerite"),
-        DocumentType.FOLHA_PAGAMENTO: ("parsers.folha_pagamento", "analyze_folha_pagamento"),
-        DocumentType.EXTRATO_BANCARIO: ("parsers.extrato_bancario", "analyze_extrato_bancario"),
+    ocr_cfg = _default_ocr_config()
+
+    try:
+        env_dpi = int(ocr_cfg.get("ocr_dpi") or 0)
+    except Exception:
+        env_dpi = 0
+    dpi = max(350, env_dpi) if env_dpi else 350
+
+    pdf_bytes = base64.b64decode(raw.content_b64)
+    candidates: List[Dict[str, Any]] = []
+
+    # 1) multipass
+    try:
+        from core.ocr import _ocr_pdf_bytes_multipass
+
+        t_mp, variant = _ocr_pdf_bytes_multipass(
+            pdf_bytes,
+            poppler_path=str(ocr_cfg.get("poppler_path") or ""),
+            dpi=dpi,
+        )
+        candidates.append({"text": t_mp or "", "source": "multipass", "variant": variant, "dpi": dpi})
+    except Exception as e:
+        candidates.append({"text": "", "source": "multipass", "error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc(), "dpi": dpi})
+
+    # 2) generic OCR
+    try:
+        from core.ocr import extract_text_any
+
+        t_any, dbg_any = extract_text_any(
+            file_bytes=pdf_bytes,
+            filename=raw.filename,
+            tesseract_cmd=str(ocr_cfg.get("tesseract_cmd") or ""),
+            poppler_path=str(ocr_cfg.get("poppler_path") or ""),
+            min_text_len_threshold=int(ocr_cfg.get("min_text_len_threshold") or 120),
+            ocr_dpi=dpi,
+        )
+        candidates.append({"text": t_any or "", "source": "generic", "dbg": dbg_any or {}, "dpi": dpi})
+    except Exception as e:
+        candidates.append({"text": "", "source": "generic", "error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc(), "dpi": dpi})
+
+    # score
+    def _score(txt: str) -> Tuple[int, Dict[str, Any]]:
+        txt = txt or ""
+        rs: Dict[str, Any] = {"text_len": len(txt)}
+        s = 0
+
+        # heurística mínima (mesmo sem parser)
+        up = txt.upper()
+        if "SENATRAN" in up or "SECRETARIA NACIONAL" in up:
+            s += 2
+        if re.search(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b", txt):
+            s += 8
+            rs["cpf_like"] = True
+        if re.search(r"\b\d{2}/\d{2}/\d{4}\b", txt):
+            s += 3
+            rs["dates_like"] = True
+
+        if analyze_cnh_fn is not None:
+            try:
+                fields, dbg = analyze_cnh_fn(raw_text=txt, filename=raw.filename)
+                if fields.get("cpf"):
+                    s += 10
+                    rs["cpf"] = True
+                if fields.get("validade"):
+                    s += 6
+                    rs["validade"] = True
+                if fields.get("data_nascimento"):
+                    s += 4
+                    rs["data_nascimento"] = True
+                if fields.get("cidade_nascimento") and fields.get("uf_nascimento"):
+                    s += 4
+                    rs["naturalidade"] = True
+                if fields.get("nome"):
+                    s += 6
+                    rs["nome"] = True
+                rs["mode"] = (dbg or {}).get("mode")
+                rs["nome_detectado"] = (dbg or {}).get("nome_detectado")
+                rs["found_dates"] = (dbg or {}).get("found_dates")
+            except Exception as e:
+                rs["analyze_error"] = f"{type(e).__name__}: {e}"
+
+        if len(txt) < 300:
+            s -= 5
+            rs["penalidade_texto_curto"] = len(txt)
+
+        return s, rs
+
+    scored: List[Dict[str, Any]] = []
+    for c in candidates:
+        sc, rs = _score(c.get("text") or "")
+        scored.append({**c, "score": sc, "reasons": rs})
+
+    scored_sorted = sorted(scored, key=lambda x: (x.get("score", 0), len(x.get("text") or "")), reverse=True)
+    best_text = (scored_sorted[0].get("text") or "").strip() if scored_sorted else ""
+    if not best_text:
+        best_text = "\n".join([(x.get("text") or "").strip() for x in scored_sorted if (x.get("text") or "").strip()]).strip()
+
+    dbg = {
+        "mode": "cnh_best_selector",
+        "dpi": dpi,
+        "chosen": {
+            "source": scored_sorted[0].get("source") if scored_sorted else None,
+            "variant": scored_sorted[0].get("variant") if scored_sorted else None,
+            "score": scored_sorted[0].get("score") if scored_sorted else None,
+            "text_len": len(best_text),
+        },
+        "candidates": [
+            {
+                "source": x.get("source"),
+                "variant": x.get("variant"),
+                "score": x.get("score"),
+                "text_len": len(x.get("text") or ""),
+                "has_error": bool(x.get("error")),
+                "reasons": x.get("reasons"),
+            }
+            for x in scored_sorted
+        ],
     }
 
+    # se ainda vazio, adiciona diagnóstico do OCR (sem bloquear)
+    if not best_text:
+        try:
+            from core.ocr import diagnose_environment
 
-def _load_parser_for(dt: DocumentType) -> Optional[ParserFn]:
-    spec = _parser_specs().get(dt)
-    if not spec:
-        return None
-    module_name, fn_name = spec
-    try:
-        mod = __import__(module_name, fromlist=[fn_name])
-        fn = getattr(mod, fn_name)
-        return fn if callable(fn) else None
-    except Exception:
-        return None
+            dbg["diagnose_environment"] = diagnose_environment(
+                tesseract_cmd=str(ocr_cfg.get("tesseract_cmd") or ""),
+                poppler_path=str(ocr_cfg.get("poppler_path") or ""),
+            )
+        except Exception as e:
+            dbg["diagnose_environment_error"] = f"{type(e).__name__}: {e}"
+
+    return best_text or "", dbg
 
 
-def _invoke_parser(
-    parser: ParserFn,
+def _doc_payload(
     *,
-    file_path: str,
-    raw_text: str,
-    filename: str,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """
-    Invoca o parser de forma tolerante a variações de assinatura.
-
-    Contratos encontrados no projeto:
-    - analyze_proposta_daycoval(raw_text: str, ...) -> dict
-    - analyze_cnh(raw_text=..., ...) -> (dict, dbg)
-    - parsers antigos podem aceitar (file_path: str) -> dict
-
-    Retorna: (fields, parser_debug)
-    """
-    try:
-        import inspect
-
-        sig = inspect.signature(parser)
-        params = sig.parameters
-
-        # Caso 1: aceita raw_text (keyword ou positional)
-        if "raw_text" in params:
-            out = parser(raw_text=raw_text or "", filename=filename)
-        else:
-            # Caso 2: assume API antiga por caminho
-            out = parser(file_path)
-
-        # Normaliza retorno
-        if isinstance(out, tuple) and len(out) == 2 and isinstance(out[0], dict) and isinstance(out[1], dict):
-            return out[0], out[1]
-        if isinstance(out, dict):
-            return out, None
-
-        return None, {"warning": "unexpected_return_type", "type": type(out).__name__}
-    except Exception as e:
-        return None, {"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
-
-
-# ======================================================================================
-# Payload bruto + persistência
-# ======================================================================================
-
-@dataclass(frozen=True)
-class RawPayload:
-    filename: str
-    mime_type: str
-    size_bytes: int
-    sha256: str
-    content_b64: str
-
-
-def _read_file_as_raw_payload(file_path: str) -> RawPayload:
-    p = Path(file_path)
-    data = p.read_bytes()
-
-    sha = hashlib.sha256(data).hexdigest()
-    mime, _enc = mimetypes.guess_type(str(p))
-    if not mime:
-        mime = "application/octet-stream"
-
-    return RawPayload(
-        filename=p.name,
-        mime_type=mime,
-        size_bytes=len(data),
-        sha256=sha,
-        content_b64=base64.b64encode(data).decode("ascii"),
-    )
-
-
-def _build_doc_record(
-    *,
-    case_id: str,
+    dt: DocumentType,
     doc_id: str,
-    document_type: DocumentType,
     raw: RawPayload,
-    parsed_data: Optional[Dict[str, Any]],
-    parse_error: Optional[Dict[str, Any]],
-    extractor_debug: Optional[Dict[str, Any]] = None,
-    parser_debug: Optional[Dict[str, Any]] = None,
+    raw_text: str,
+    parsed: Dict[str, Any] | None,
+    parse_error: Dict[str, Any] | None,
+    extractor_debug: Dict[str, Any] | None,
+    parser_debug: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
     return {
-        "schema_version": "phase1.v1",
-        "phase": 1,
-        "case_id": case_id,
-        "doc_id": doc_id,
-        "document_type": document_type.value,
-        "created_at": _utc_now_iso(),
+        "meta": {
+            "doc_id": doc_id,
+            "document_type": dt.value,
+            "filename": raw.filename,
+            "mime_type": raw.mime_type,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+            "raw_b64_len": len(raw.content_b64 or ""),
+        },
         "raw": {
             "filename": raw.filename,
             "mime_type": raw.mime_type,
-            "size_bytes": raw.size_bytes,
-            "sha256": raw.sha256,
             "content_b64": raw.content_b64,
         },
-        "data": parsed_data,
-        "debug": {
-            "extractor": extractor_debug,
-            "parser": parser_debug,
-            "parse_error": parse_error,
-        },
+        "raw_text": raw_text,
+        "text": raw_text,
+        "text_len": len(raw_text or ""),
+        "data": parsed or {},
+        "parse_error": parse_error,
+        "extractor_debug": extractor_debug,
+        "parser_debug": parser_debug,
     }
-
-
-def _write_doc_json(case_id: str, document_type: DocumentType, doc_id: str, doc: Dict[str, Any]) -> Path:
-    out_dir = _storage_root() / case_id / document_type.value
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{doc_id}.json"
-    out_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out_path
-
-
-# ======================================================================================
-# Public API (Fase 1)
-# ======================================================================================
-
-def start_case(*, storage_root: str | Path | None = None) -> str:
-    """
-    Compat com testes: aceita storage_root (ex.: .../storage/phase1).
-    """
-    if storage_root is not None:
-        _set_storage_root(storage_root)
-    return str(uuid.uuid4())
 
 
 def collect_document(
@@ -380,22 +371,6 @@ def collect_document(
     document_type: str | DocumentType,
     storage_root: str | Path | None = None,
 ) -> Dict[str, Any]:
-    """
-    Coleta e persiste um documento na Fase 1.
-
-    Regras:
-    - Não bloquear fluxo (sempre persiste bruto; parser pode falhar / pode ser pulado).
-    - Não aprovar/reprovar.
-    - Estrutura: storage/phase1/<case_id>/<document_type>/<doc_id>.json
-
-    Importante:
-    - Por padrão, NÃO fazemos parsing dos docs opcionais (holerite/folha/extrato) na Fase 1,
-      para evitar travamentos e porque as inferências/validações rodam depois.
-    - Se você quiser forçar parsing dos opcionais: export PHASE1_PARSE_OPTIONAL_DOCS=1
-
-    Exceção (decisão A):
-    - CNH_SENATRAN força OCR na extração de texto para parsing em Phase 1.
-    """
     if storage_root is not None:
         _set_storage_root(storage_root)
 
@@ -410,192 +385,76 @@ def collect_document(
     parser_debug: Optional[Dict[str, Any]] = None
 
     parse_optional = _env_truthy("PHASE1_PARSE_OPTIONAL_DOCS", default="0")
+    should_parse = not (dt in OPTIONAL_DOCS and not parse_optional)
 
-    should_parse = True
-    if dt in OPTIONAL_DOCS and not parse_optional:
-        should_parse = False
+    raw_text = ""
 
-    if should_parse:
-        parser = _load_parser_for(dt)
-        if parser is not None:
-            # 1) extrair texto (não-bloqueante)
+    # 1) SEMPRE extrair texto para CNH (mesmo se parser falhar/indisponível)
+    if dt in (DocumentType.CNH, DocumentType.CNH_SENATRAN):
+        analyze_cnh_fn = None
+        try:
+            analyze_cnh_fn = _load_parser_for(dt)  # pode falhar/import
+        except Exception as e:
+            parser_debug = {"error": f"load_parser_error: {type(e).__name__}: {e}", "traceback": traceback.format_exc()}
+            analyze_cnh_fn = None
+
+        try:
+            raw_text, extractor_debug = _extract_text_cnh_best(file_path, raw, analyze_cnh_fn=analyze_cnh_fn)
+        except Exception as e:
+            raw_text = ""
+            extractor_debug = {"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
+
+        # se veio vazio, registra erro de extração (sem bloquear)
+        if not (raw_text or "").strip():
+            parse_error = {
+                "type": "ExtractorError",
+                "message": "CNH raw_text ficou vazio (OCR falhou ou não executou). Veja extractor_debug.",
+            }
+
+        # parse só se should_parse e se temos parser (CNH usa analyze_cnh)
+        if should_parse and analyze_cnh_fn is not None and (raw_text or "").strip():
+            parsed, parser_debug, parse_error2 = _invoke_parser(analyze_cnh_fn, raw_text=raw_text, filename=raw.filename)
+            if parse_error is None:
+                parse_error = parse_error2
+
+    else:
+        # fluxo normal (outros docs)
+        if should_parse:
+            parser = None
+            try:
+                parser = _load_parser_for(dt)
+            except Exception as e:
+                parser = None
+                parser_debug = {"error": f"load_parser_error: {type(e).__name__}: {e}", "traceback": traceback.format_exc()}
+
             try:
                 raw_text, extractor_debug = _extract_text_phase1(
                     file_path,
                     raw,
-                    force_ocr=(dt == DocumentType.CNH_SENATRAN),
+                    force_ocr=False,
                 )
             except Exception as e:
                 raw_text = ""
                 extractor_debug = {"error": f"{type(e).__name__}: {e}", "traceback": traceback.format_exc()}
 
-            # 2) invocar parser (tolerante a assinatura)
-            parsed, parser_debug = _invoke_parser(
-                parser,
-                file_path=file_path,
-                raw_text=raw_text or "",
-                filename=raw.filename,
-            )
+            if parser is not None and (raw_text or "").strip():
+                parsed, parser_debug, parse_error = _invoke_parser(parser, raw_text=raw_text, filename=raw.filename)
 
-            # 2b) Retry inteligente (CNH / Proposta): se ha texto nativo mas
-            # os campos minimos nao foram extraidos, forca OCR e tenta de novo.
-            # Isso evita depender de PHASE1_ENABLE_OCR para documentos que
-            # frequentemente trazem apenas o cabecalho no texto nativo.
-            try:
-                def _missing_fields_for_retry(dt_: DocumentType, fields: Optional[Dict[str, Any]]) -> List[str]:
-                    if not fields or not isinstance(fields, dict):
-                        return []
-                    if dt_ == DocumentType.CNH:
-                        miss = []
-                        if not fields.get("nome"):
-                            miss.append("nome")
-                        if not fields.get("data_nascimento"):
-                            miss.append("data_nascimento")
-                        return miss
-                    if dt_ == DocumentType.PROPOSTA_DAYCOVAL:
-                        miss = []
-                        # contrato minimo para Phase2 (renda) e identidade
-                        if not fields.get("nome_financiado") and not fields.get("nome"):
-                            miss.append("nome_financiado")
-                        if not fields.get("data_nascimento"):
-                            miss.append("data_nascimento")
-                        # renda declarada pode existir como salario/outras_rendas
-                        if fields.get("salario") is None and fields.get("outras_rendas") is None:
-                            miss.append("renda_declarada")
-                        return miss
-                    return []
+    # persist
+    out_dir = _phase1_doc_dir(case_id, dt)
+    _ensure_dir(out_dir)
+    out_path = out_dir / f"{doc_id}.json"
 
-                missing_for_retry = _missing_fields_for_retry(dt, parsed)
-                if missing_for_retry:
-                    raw_text_ocr, extractor_debug_ocr = _extract_text_phase1(
-                        file_path,
-                        raw,
-                        force_ocr=True,
-                    )
-                    parsed_ocr, parser_debug_ocr = _invoke_parser(
-                        parser,
-                        file_path=file_path,
-                        raw_text=raw_text_ocr or "",
-                        filename=raw.filename,
-                    )
-
-                    # Aceita retry apenas se melhorou algo (evita degradacao).
-                    missing_after = _missing_fields_for_retry(dt, parsed_ocr)
-                    improved = len(missing_after) < len(missing_for_retry)
-
-                    if improved:
-                        parsed = parsed_ocr
-                        parser_debug = parser_debug_ocr
-                        extractor_debug = {
-                            "native_first": extractor_debug,
-                            "ocr_retry": extractor_debug_ocr,
-                            "ocr_retry_used": True,
-                            "missing_before": missing_for_retry,
-                            "missing_after": missing_after,
-                        }
-                    else:
-                        extractor_debug = {
-                            "native_first": extractor_debug,
-                            "ocr_retry": extractor_debug_ocr,
-                            "ocr_retry_used": False,
-                            "missing_before": missing_for_retry,
-                            "missing_after": missing_after,
-                        }
-            except Exception as _retry_e:
-                # Nao quebra: apenas anexa debug
-                extractor_debug = extractor_debug or {}
-                extractor_debug = {
-                    "native_first": extractor_debug,
-                    "ocr_retry_error": f"{type(_retry_e).__name__}: {_retry_e}",
-                }
-
-            # 3) se parser retornou warning/error, promover para parse_error (sem quebrar)
-            if parser_debug and ("error" in parser_debug):
-                parse_error = {
-                    "message": parser_debug.get("error"),
-                    "type": "ParserError",
-                    "traceback": parser_debug.get("traceback"),
-                }
-        else:
-            parse_error = {
-                "message": "Parser not available for this document_type",
-                "type": "ParserNotAvailable",
-                "traceback": None,
-            }
-    else:
-        parse_error = {
-            "message": "Parsing skipped for optional document in Phase 1",
-            "type": "ParsingSkippedOptional",
-            "traceback": None,
-        }
-
-    doc = _build_doc_record(
-        case_id=case_id,
+    doc = _doc_payload(
+        dt=dt,
         doc_id=doc_id,
-        document_type=dt,
         raw=raw,
-        parsed_data=parsed,
+        raw_text=raw_text or "",
+        parsed=parsed,
         parse_error=parse_error,
         extractor_debug=extractor_debug,
         parser_debug=parser_debug,
     )
 
-    _write_doc_json(case_id, dt, doc_id, doc)
+    out_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
     return doc
-
-
-def gate1_is_ready(case_id: str) -> bool:
-    """
-    Gate 1 INTACTO: apenas Proposta Daycoval + CNH.
-    """
-    root = _storage_root() / case_id
-    return _has_any_json(root / DocumentType.PROPOSTA_DAYCOVAL.value) and _has_any_json(root / DocumentType.CNH.value)
-
-
-def case_status(case_id: str) -> CaseStatus:
-    """
-    Contrato esperado pelos testes:
-    - st.is_complete
-    - st.missing contém tipos faltantes do Gate 1
-    """
-    root = _storage_root() / case_id
-
-    proposta_dir = root / DocumentType.PROPOSTA_DAYCOVAL.value
-    cnh_dir = root / DocumentType.CNH.value
-
-    has_proposta = _has_any_json(proposta_dir)
-    has_cnh = _has_any_json(cnh_dir)
-
-    missing: List[str] = []
-    if not has_proposta:
-        missing.append(DocumentType.PROPOSTA_DAYCOVAL.value)
-    if not has_cnh:
-        missing.append(DocumentType.CNH.value)
-
-    gate1_ready = has_proposta and has_cnh
-
-    has_holerite = _has_any_json(root / DocumentType.HOLERITE.value)
-    has_folha = _has_any_json(root / DocumentType.FOLHA_PAGAMENTO.value)
-    has_extrato = _has_any_json(root / DocumentType.EXTRATO_BANCARIO.value)
-
-    types: Dict[str, List[str]] = {}
-    if root.exists():
-        for dt in DocumentType:
-            d = root / dt.value
-            if d.exists():
-                files = sorted(p.name for p in d.glob("*.json"))
-                if files:
-                    types[dt.value] = files
-
-    return CaseStatus(
-        case_id=case_id,
-        has_proposta_daycoval=has_proposta,
-        has_cnh=has_cnh,
-        gate1_ready=gate1_ready,
-        is_complete=gate1_ready,
-        missing=missing,
-        has_holerite=has_holerite,
-        has_folha_pagamento=has_folha,
-        has_extrato_bancario=has_extrato,
-        types=types,
-    )

@@ -1,14 +1,13 @@
+# core/ocr.py
+import base64
 import os
 import re
-import tempfile
+import shutil
 import subprocess
-from typing import Tuple, Dict, Any, List
+import tempfile
+from typing import Any, Dict, List, Tuple
 
-from PIL import Image, ImageOps, ImageEnhance
-
-# OCR deps (pytesseract) sao opcionais em alguns ambientes.
-# Ao manter o import lazy, evitamos quebrar a aplicacao inteira quando
-# o usuario ainda nao instalou dependencias de OCR.
+from PIL import Image, ImageEnhance, ImageOps
 
 
 def normalize_text(s: str) -> str:
@@ -18,43 +17,73 @@ def normalize_text(s: str) -> str:
     return s.strip()
 
 
+def _resolve_tesseract_cmd(tesseract_cmd: str | None) -> str:
+    """
+    Nunca retorne string vazia.
+    - se vier vazio, tenta shutil.which("tesseract")
+    - se não achar, retorna "tesseract" (deixa o SO resolver)
+    """
+    cmd = (tesseract_cmd or "").strip()
+    if cmd:
+        return cmd
+    found = shutil.which("tesseract")
+    return found or "tesseract"
+
+
+def _ensure_pytesseract_cmd(tesseract_cmd: str | None) -> str:
+    """
+    Garante que pytesseract esteja apontando para um comando válido.
+    Retorna o cmd efetivo.
+    """
+    cmd = _resolve_tesseract_cmd(tesseract_cmd)
+    try:
+        import pytesseract  # type: ignore
+
+        # só seta se for algo não-vazio (cmd aqui nunca é vazio)
+        pytesseract.pytesseract.tesseract_cmd = cmd
+    except Exception:
+        # Sem pytesseract, não tem OCR (extract_text_any lida com isso).
+        pass
+    return cmd
+
+
 def diagnose_environment(tesseract_cmd: str, poppler_path: str) -> Dict[str, Any]:
+    cmd = _ensure_pytesseract_cmd(tesseract_cmd)
+
     diag: Dict[str, Any] = {
-        "tesseract_cmd": tesseract_cmd,
+        "tesseract_cmd_effective": cmd,
+        "tesseract_cmd_input": tesseract_cmd,
         "poppler_path": poppler_path,
         "tesseract_version": None,
         "pdfplumber": None,
         "poppler_pdftoppm": None,
         "poppler_version": None,
+        "pytesseract": None,
     }
 
-    # pdfplumber (opcional)
     try:
         import importlib.metadata as _md
+
         import pdfplumber  # noqa: F401
+
         diag["pdfplumber"] = f"ok: {_md.version('pdfplumber')}"
     except Exception as e:
-        diag["pdfplumber"] = f"ausente/erro: {type(e).__name__}: {e}"
+        diag["pdfplumber"] = f"erro: {type(e).__name__}: {e}"
 
-    # pytesseract (opcional) + tesseract
     try:
         import importlib.metadata as _md
+
         import pytesseract  # type: ignore
 
         diag["pytesseract"] = f"ok: {_md.version('pytesseract')}"
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-        v = subprocess.check_output([tesseract_cmd, "--version"], text=True, stderr=subprocess.STDOUT)
-        diag["tesseract_version"] = v.strip()
-    except Exception as e:
-        diag["pytesseract"] = f"ausente/erro: {type(e).__name__}: {e}"
-        # Mesmo sem pytesseract, tentar ao menos confirmar o binario.
         try:
-            v = subprocess.check_output([tesseract_cmd, "--version"], text=True, stderr=subprocess.STDOUT)
+            v = subprocess.check_output([cmd, "--version"], text=True, stderr=subprocess.STDOUT)
             diag["tesseract_version"] = v.strip()
-        except Exception as e2:
-            diag["tesseract_version"] = f"erro: {type(e2).__name__}: {e2}"
+        except Exception as e:
+            diag["tesseract_version"] = f"erro: {type(e).__name__}: {e}"
+    except Exception as e:
+        diag["pytesseract"] = f"erro: {type(e).__name__}: {e}"
 
-    # pdftoppm
     try:
         pdftoppm = _find_pdftoppm(poppler_path)
         diag["poppler_pdftoppm"] = pdftoppm
@@ -76,24 +105,26 @@ def extract_text_any(
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Retorna (texto, debug).
-    - PDF: tenta texto nativo (pdfplumber) e, se insuficiente, OCR do PDF renderizado (pdftoppm + tesseract).
+    - PDF: tenta texto nativo (pdfplumber) e, se insuficiente, OCR (pdftoppm + tesseract).
     - Imagem: OCR direto.
     """
     fn = (filename or "").lower()
+    cmd = _ensure_pytesseract_cmd(tesseract_cmd)
+
     dbg: Dict[str, Any] = {
         "debug_src": None,
         "pages": None,
         "text_len": 0,
         "ocr_retry": False,
+        "tesseract_cmd_effective": cmd,
+        "poppler_path": poppler_path or "",
     }
 
-    # OCR deps podem nao estar instalados; manter a aplicacao viva e
-    # retornar debug claro.
+    # OCR deps
     try:
-        import pytesseract  # type: ignore
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+        import pytesseract  # noqa: F401
     except Exception as e:
-        # Sem pytesseract nao ha OCR. Ainda assim, tentamos texto nativo (PDF).
+        # Sem OCR, ainda tenta nativo em PDF
         if fn.endswith(".pdf"):
             text, dbg_pdf = _extract_pdf_text(
                 pdf_bytes=file_bytes,
@@ -125,11 +156,38 @@ def extract_text_any(
         dbg["text_len"] = len(text or "")
         return normalize_text(text), dbg
 
-    # imagem
-    text = _ocr_image_bytes(file_bytes)
     dbg["debug_src"] = "image_ocr"
-    dbg["text_len"] = len(text or "")
-    return normalize_text(text), dbg
+    try:
+        from io import BytesIO
+
+        img = Image.open(BytesIO(file_bytes))
+        text = _ocr_image(img, tesseract_cmd=cmd)
+        dbg["text_len"] = len(text or "")
+        return normalize_text(text), dbg
+    except Exception as e:
+        dbg["ocr_error"] = f"{type(e).__name__}: {e}"
+        return "", dbg
+
+
+def _looks_like_serpro_only(text: str) -> bool:
+    if not text:
+        return True
+    t = text.upper()
+    hits = 0
+    for token in [
+        "REPÚBLICA",
+        "REPUBLICA",
+        "FEDERATIVA",
+        "BRASIL",
+        "SECRETARIA NACIONAL",
+        "SENATRAN",
+        "CARTEIRA NACIONAL",
+        "TRÂNSITO",
+        "TRANSITO",
+    ]:
+        if token in t:
+            hits += 1
+    return hits >= 3 and len(t) < 1500
 
 
 def _extract_pdf_text(
@@ -150,10 +208,10 @@ def _extract_pdf_text(
     text_plumber = ""
     pages = 0
 
-    # 1) Texto nativo via pdfplumber (se disponível)
     try:
         import io
-        import pdfplumber  # import lazy
+        import pdfplumber  # type: ignore
+
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             pages = len(pdf.pages)
             out = []
@@ -165,12 +223,10 @@ def _extract_pdf_text(
 
     dbg["pages"] = pages
 
-    # Heurística para decidir OCR
     needs_ocr = (len(text_plumber) < min_text_len_threshold) or _looks_like_serpro_only(text_plumber)
     if not needs_ocr:
         return text_plumber, dbg
 
-    # 2) OCR do PDF
     if not ocr_available:
         dbg["debug_src"] = "pdf_native_only"
         dbg["ocr_retry"] = False
@@ -178,77 +234,36 @@ def _extract_pdf_text(
             dbg["ocr_error"] = ocr_unavailable_error
         return text_plumber, dbg
 
-    # OCR disponivel
     dbg["debug_src"] = "pdf_ocr"
     dbg["ocr_retry"] = True
 
     ocr_text, variant = _ocr_pdf_bytes_multipass(pdf_bytes, poppler_path=poppler_path, dpi=ocr_dpi)
     dbg["ocr_variant"] = variant
 
-    # devolve o melhor disponível
     best = ocr_text or text_plumber
     return best, dbg
 
 
-def _looks_like_serpro_only(text: str) -> bool:
-    up = (text or "").upper()
-    if not up:
-        return True
-    serpro_hits = any(k in up for k in ["ASSINADOR SERPRO", "MEDIDA PROVISÓRIA Nº 2200-2/2001", "SENATRAN", "QR-CODE"])
-    field_hits = any(k in up for k in ["CPF", "NOME", "FILIA", "VALIDADE", "NASC", "CATEGORIA", "REGISTRO", "CNH"])
-    return serpro_hits and (not field_hits)
+def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    img2 = ImageOps.grayscale(img)
+    img2 = ImageEnhance.Contrast(img2).enhance(1.6)
+    img2 = ImageEnhance.Sharpness(img2).enhance(1.2)
+    return img2
 
 
-def _ocr_pdf_bytes_multipass(pdf_bytes: bytes, poppler_path: str, dpi: int = 350) -> Tuple[str, str]:
+def _ocr_image(img: Image.Image, *, tesseract_cmd: str | None = None) -> str:
     """
-    Faz OCR com multipass:
-      - pass 1: página inteira
-      - pass 2: recorte superior (onde geralmente estão Nome / Nascimento)
-      - pass 3: recorte central (fallback)
-    Junta tudo removendo duplicatas de linhas.
-
-    Retorna (texto, variant_label).
+    OCR com config adequado para documento estruturado.
     """
-    pdftoppm = _find_pdftoppm(poppler_path)
+    _ensure_pytesseract_cmd(tesseract_cmd)
+    img2 = _preprocess_for_ocr(img)
+    config = "--oem 1 --psm 6"
+    import pytesseract  # type: ignore
 
-    with tempfile.TemporaryDirectory() as td:
-        pdf_path = os.path.join(td, "in.pdf")
-        with open(pdf_path, "wb") as f:
-            f.write(pdf_bytes)
-
-        out_prefix = os.path.join(td, "page")
-        cmd = [pdftoppm, "-r", str(dpi), "-png", pdf_path, out_prefix]
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        imgs = sorted([os.path.join(td, x) for x in os.listdir(td) if x.startswith("page") and x.endswith(".png")])
-        texts: List[str] = []
-        variant = "full+crop"
-
-        for p in imgs:
-            try:
-                img = Image.open(p)
-            except Exception:
-                continue
-
-            # Pass 1: full
-            t_full = _ocr_image(img)
-            # Pass 2: top crop
-            t_top = _ocr_image(_crop_ratio(img, top=0.00, bottom=0.55))
-            # Pass 3: middle crop
-            t_mid = _ocr_image(_crop_ratio(img, top=0.30, bottom=0.80))
-
-            merged = _merge_texts([t_full, t_top, t_mid])
-            texts.append(merged)
-
-        final = "\n".join([t for t in texts if t]).strip()
-        return final, variant
+    return pytesseract.image_to_string(img2, lang="por+eng", config=config)
 
 
 def _crop_ratio(img: Image.Image, top: float, bottom: float) -> Image.Image:
-    """
-    Recorta verticalmente por proporção.
-    top/bottom em [0..1].
-    """
     w, h = img.size
     y1 = max(0, min(h, int(h * top)))
     y2 = max(0, min(h, int(h * bottom)))
@@ -258,10 +273,6 @@ def _crop_ratio(img: Image.Image, top: float, bottom: float) -> Image.Image:
 
 
 def _merge_texts(texts: List[str]) -> str:
-    """
-    Mescla textos removendo duplicações grosseiras por linha.
-    Mantém ordem: full -> top -> mid.
-    """
     seen = set()
     out_lines: List[str] = []
 
@@ -281,52 +292,40 @@ def _merge_texts(texts: List[str]) -> str:
     return "\n".join(out_lines).strip()
 
 
-def _ocr_image_bytes(img_bytes: bytes) -> str:
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as tf:
-        tf.write(img_bytes)
-        tf.flush()
-        img = Image.open(tf.name)
-        return _ocr_image(img)
-
-
-def _preprocess_for_ocr(img: Image.Image) -> Image.Image:
+def _ocr_pdf_bytes_multipass(pdf_bytes: bytes, poppler_path: str, dpi: int = 350) -> Tuple[str, str]:
     """
-    Pré-processamento leve e robusto (sem OpenCV):
-    - grayscale
-    - autocontrast
-    - upscale 2x
-    - sharpen leve
-    - threshold simples
+    Multipass (full + crops). Importante: garante tesseract_cmd resolvido
+    mesmo quando chamada diretamente (sem passar por extract_text_any).
     """
-    img = img.convert("L")
-    img = ImageOps.autocontrast(img)
+    cmd = _ensure_pytesseract_cmd(os.getenv("TESSERACT_CMD", ""))
+    pdftoppm = _find_pdftoppm(poppler_path)
 
-    # upscale
-    w, h = img.size
-    img = img.resize((w * 2, h * 2))
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = os.path.join(td, "in.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(pdf_bytes)
 
-    # contraste + nitidez
-    img = ImageEnhance.Contrast(img).enhance(1.6)
-    img = ImageEnhance.Sharpness(img).enhance(1.4)
+        out_prefix = os.path.join(td, "page")
+        subprocess.check_call([pdftoppm, "-r", str(dpi), "-png", pdf_path, out_prefix])
 
-    # threshold
-    img = img.point(lambda p: 255 if p > 170 else 0)
+        imgs = sorted([os.path.join(td, x) for x in os.listdir(td) if x.startswith("page") and x.endswith(".png")])
+        texts: List[str] = []
+        variant = "full+crop"
 
-    return img
+        for p in imgs:
+            try:
+                img = Image.open(p)
+            except Exception:
+                continue
 
+            t_full = _ocr_image(img, tesseract_cmd=cmd)
+            t_top = _ocr_image(_crop_ratio(img, top=0.00, bottom=0.55), tesseract_cmd=cmd)
+            t_mid = _ocr_image(_crop_ratio(img, top=0.30, bottom=0.80), tesseract_cmd=cmd)
 
-def _ocr_image(img: Image.Image) -> str:
-    """
-    OCR com config mais adequado para documento estruturado.
-    """
-    img2 = _preprocess_for_ocr(img)
+            texts.append(_merge_texts([t_full, t_top, t_mid]))
 
-    # Config: psm 6 (blocos) funciona melhor em CNH digital do que default
-    config = "--oem 1 --psm 6"
-
-    # por+eng para pegar PT + rotulos em ingles
-    import pytesseract  # type: ignore
-    return pytesseract.image_to_string(img2, lang="por+eng", config=config)
+        final = "\n".join([t for t in texts if t]).strip()
+        return final, variant
 
 
 def _find_pdftoppm(poppler_path: str) -> str:
@@ -341,3 +340,7 @@ def _find_pdftoppm(poppler_path: str) -> str:
             return candidate
 
     raise FileNotFoundError("pdftoppm não encontrado. Ajuste POPPLER_PATH para a pasta que contém o binário.")
+
+
+def _decode_base64_to_bytes(b64: str) -> bytes:
+    return base64.b64decode(b64 or "")
