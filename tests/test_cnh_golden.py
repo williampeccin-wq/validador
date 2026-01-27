@@ -1,4 +1,3 @@
-# tests/test_cnh_golden.py
 from __future__ import annotations
 
 import json
@@ -48,27 +47,20 @@ def _analyze(raw_text: str, filename: str) -> tuple[dict, dict]:
 @pytest.mark.parametrize(
     "fixture_txt, expected_json, filename",
     [
-        # CNH “DIGITAL” (na prática: SENATRAN/SERPRO) — Anderson
+        # ✅ CNH “DIGITAL” (SENATRAN/SERPRO) — Anderson
         (
             FIXTURES_DIR / "cnh_ocr.txt",
             GOLDENS_DIR / "cnh_expected.json",
             "CNH DIGITAL.pdf",
         ),
-        # CNH SENATRAN / Detalhamento — Lucas
-        (
-            FIXTURES_DIR / "cnh_senatran_lucas_ocr.txt",
-            GOLDENS_DIR / "cnh_senatran_lucas_expected.json",
-            "lucasTambreValidCNH.pdf",
-        ),
     ],
 )
 def test_cnh_golden_from_saved_ocr_text(fixture_txt: Path, expected_json: Path, filename: str):
     """
-    Teste GOLDEN do DOCUMENTO CNH (Opção A):
+    Teste GOLDEN do DOCUMENTO CNH (apenas CNH).
 
-    - CNH é UM documento, com UM contrato.
-    - Origem/layout (PDF, app, “CNH DIGITAL”, “Detalhamento”) não cria um novo tipo.
-    - Neste repo, os exemplos são SENATRAN (dbg.mode == "senatran").
+    Importante:
+    - “lucasTambreValidCNH.pdf” NÃO é CNH (é um comprovante/validação) e deve ser testado separadamente.
     """
     assert fixture_txt.exists(), f"Fixture não encontrado: {fixture_txt}"
 
@@ -76,10 +68,8 @@ def test_cnh_golden_from_saved_ocr_text(fixture_txt: Path, expected_json: Path, 
 
     fields, dbg = _analyze(raw_text=raw_text, filename=filename)
 
-    # Regra de arquitetura desta opção:
     assert dbg.get("mode") == "senatran", f"CNH deve estar em modo senatran. dbg={dbg}"
 
-    # Se quiser atualizar conscientemente o golden:
     if os.getenv("UPDATE_GOLDEN") == "1":
         _write_json(expected_json, fields)
 
@@ -89,5 +79,4 @@ def test_cnh_golden_from_saved_ocr_text(fixture_txt: Path, expected_json: Path, 
     )
     expected = _load_json(expected_json)
 
-    # Congela o contrato por igualdade exata
     assert fields == expected, f"Got={fields} dbg={dbg}"
