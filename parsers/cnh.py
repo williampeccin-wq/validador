@@ -1,3 +1,4 @@
+# parsers/cnh.py
 from __future__ import annotations
 
 import re
@@ -19,54 +20,44 @@ def _normalize_spaces(s: str) -> str:
 
 
 def _normalize_person_name(s: str) -> str:
-    """Normalize a candidate person name extracted from OCR text.
+    """
+    Normalize a candidate person name extracted from OCR text.
 
-    OCR for CNH/SENATRAN frequently appends garbage tokens (e.g. "KE RTF E E GE A")
-    from UI glyphs around the name field. This function aggressively cleans those
-    artifacts while keeping legitimate Portuguese connectors (DE/DA/DO/DAS/DOS).
+    OCR para CNH/SENATRAN frequentemente injeta tokens lixo ao redor dos campos.
     """
     if not s:
         return ""
 
-    # Keep only the left side when OCR uses "|" separators
     s = s.split("|", 1)[0]
-
     s = s.upper().strip()
-    # Remove dates that often appear on the same line as the name
     s = _DATE_RE.sub(" ", s)
 
-    # Strip bracket-like noise and non-letter characters (keep spaces)
     s = re.sub(r"[\[\]\(\)\{\}<>]", " ", s)
     s = re.sub(r"[^A-ZÀ-Ü\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-
     if not s:
         return ""
 
     keep_connectors = {"DE", "DA", "DO", "DAS", "DOS"}
     junk_tokens = {
-        # Common OCR debris around CNH name field
         "KE", "KH", "RTF", "GE", "GI", "NM", "MM", "NA", "ALO", "ACC",
         "QR", "CODE",
     }
     vowel_re = re.compile(r"[AEIOUÀ-Ü]")
 
-    out = []
+    out: List[str] = []
     for tok in s.split():
         if tok in keep_connectors:
             out.append(tok)
             continue
         if tok in junk_tokens:
             continue
-        # Drop single-letter tokens ("E" is almost always noise here)
         if len(tok) <= 1:
             continue
-        # Drop short tokens with no vowels (e.g. "RTF")
         if len(tok) <= 3 and not vowel_re.search(tok):
             continue
         out.append(tok)
 
-    # Remove connector leftovers at ends (e.g. "DE" as last token)
     while out and out[0] in keep_connectors:
         out.pop(0)
     while out and out[-1] in keep_connectors:
@@ -117,7 +108,6 @@ def _extract_name_from_mrz(lines: List[str]) -> Optional[str]:
 
 
 def _find_best_name_candidate(lines: List[str]) -> Optional[str]:
-    """Prefer MRZ-derived name. Fallback to the 'NOME' context line."""
     mrz = _extract_name_from_mrz(lines)
     if mrz:
         return mrz
@@ -199,15 +189,12 @@ def _find_data_nascimento(lines: List[str]) -> Optional[str]:
 
 def _find_categoria_prefere_registro(text_upper: str, cpf_digits: Optional[str]) -> Optional[str]:
     """
-    Extract category from the *registration-number zone*:
-      - look for: 11 digits + whitespace + single-letter category [A-E]
-      - ignore a match where the 11 digits == CPF (CPF is also 11 digits)
-      - if multiple matches exist, prefer the right-most one (closest to the CNH layout row)
+    Extrai categoria simples/composta (A-E / AB / AE etc) da zona de registro.
     """
     if not text_upper:
         return None
 
-    matches = list(re.finditer(r"\b(\d{11})\b\s+([A-E])\b", text_upper))
+    matches = list(re.finditer(r"\b(\d{11})\b\s+([A-E]{1,2})\b", text_upper))
     if matches:
         filtered = []
         for m in matches:
@@ -221,7 +208,7 @@ def _find_categoria_prefere_registro(text_upper: str, cpf_digits: Optional[str])
         pool.sort(key=lambda x: x[0])
         return pool[-1][2]
 
-    m2 = re.search(r"\bCAT\b.{0,60}\b([A-E])\b", text_upper)
+    m2 = re.search(r"\bCAT\b.{0,60}\b([A-E]{1,2})\b", text_upper)
     if m2:
         return m2.group(1)
 
@@ -230,35 +217,30 @@ def _find_categoria_prefere_registro(text_upper: str, cpf_digits: Optional[str])
 
 def _clean_filiacao_line(s: str) -> str:
     """
-    Clean OCR noise from filiacao lines while preserving real names.
-    Goal: return something like 'EDSON ESPINDOLA DE BARROS' / 'SONIA MARIA DOS SANTOS'.
+    Limpa ruído de OCR no bloco FILIAÇÃO.
     """
     if not s:
         return ""
 
     u = s.upper()
-
-    # Cut off right-side junk if OCR uses separators
     u = u.split("|", 1)[0]
-
-    # Drop the label itself if it leaked into the line
     u = re.sub(r"\bFILIA(?:ÇÃO|CAO)\b", " ", u)
-
-    # Keep only letters/spaces
     u = re.sub(r"[^A-ZÀ-Ü\s]", " ", u)
     u = _normalize_spaces(u)
-
     if not u:
         return ""
 
     keep_connectors = {"DE", "DA", "DO", "DAS", "DOS"}
-    # Very common garbage tokens in this region (from UI glyphs / OCR artifacts)
+
+    # ⚠️ tokens lixo típicos do campo (inclui os que você viu no Anderson)
     junk_tokens = {
         "S", "M", "O", "OO", "ES", "GI", "NM", "MM", "EM", "RE", "IO", "LH",
-        "WERT", "LAT", "LALATE", "TR", "AH", "B",
+        "WERT", "LAT", "LALATE",
         "ASSINATURA", "PORTADOR", "OBSERVACOES", "OBSERVAÇÕES",
         "NACIONALIDADE", "BRASILEIRO", "LEMA",
+        "CAT", "HAB", "CNH",
     }
+
     vowel_re = re.compile(r"[AEIOUÀ-Ü]")
 
     out: List[str] = []
@@ -268,15 +250,17 @@ def _clean_filiacao_line(s: str) -> str:
             continue
         if tok in junk_tokens:
             continue
-        # Drop single-letter tokens
-        if len(tok) <= 1:
+
+        # regra dura para tirar "LH IO" etc
+        if len(tok) < 3:
             continue
-        # Drop very short tokens without vowels (e.g. "TR")
-        if len(tok) <= 2 and not vowel_re.search(tok):
+
+        # tokens curtos sem vogal são quase sempre lixo
+        if len(tok) <= 3 and not vowel_re.search(tok):
             continue
+
         out.append(tok)
 
-    # Trim connectors at ends
     while out and out[0] in keep_connectors:
         out.pop(0)
     while out and out[-1] in keep_connectors:
@@ -285,34 +269,51 @@ def _clean_filiacao_line(s: str) -> str:
     return " ".join(out)
 
 
-def _is_plausible_person_line(s: str) -> bool:
+def _score_parent_line(s: str) -> float:
     """
-    Heuristic: a plausible parent-name line should have >=2 tokens,
-    and >=2 tokens should contain vowels (to reject 'WERT LAT ...').
+    Score de “linha de nome de pai/mãe”.
+    Queremos privilegiar nomes com muitas vogais e palavras longas,
+    e derrubar linhas “sem sentido”.
     """
     if not s:
-        return False
+        return 0.0
     toks = s.split()
     if len(toks) < 2:
-        return False
+        return 0.0
+
     vowel_re = re.compile(r"[AEIOUÀ-Ü]")
-    vowel_tokens = sum(1 for t in toks if vowel_re.search(t))
-    if vowel_tokens < 2:
-        return False
-    # Reject if too many very short tokens (still noisy)
-    short = sum(1 for t in toks if len(t) <= 2)
-    if short >= max(2, len(toks) // 2):
-        return False
-    return True
+    vowels = sum(len(vowel_re.findall(t)) for t in toks)
+    letters = sum(len(t) for t in toks)
+    vowel_ratio = (vowels / letters) if letters else 0.0
+
+    avg_len = letters / max(1, len(toks))
+    connectors = {"DE", "DA", "DO", "DAS", "DOS"}
+    has_connector = any(t in connectors for t in toks)
+
+    # base
+    score = 0.0
+    score += 2.0 * vowel_ratio
+    score += 0.15 * avg_len
+    score += 0.6 if has_connector else 0.0
+    score += 0.25 * min(6, len(toks))
+
+    # penaliza tokens “estranhos” recorrentes
+    bad = {"WERT", "LAT", "LALATE"}
+    if any(t in bad for t in toks):
+        score -= 2.0
+
+    return score
 
 
 def _find_filiacao(lines: List[str]) -> List[str]:
     """
-    Extract filiacao (usually two lines: pai / mãe) after the 'FILIAÇÃO' label,
-    aggressively filtering OCR noise.
+    Extrai FILIAÇÃO:
+    - coleta candidatos logo após o label
+    - faz ranking por score
+    - devolve 1 ou 2 linhas boas (descarta lixo tipo “WERT LAT LALATE”)
     """
     stop_markers = ("ASSINAT", "OBSERV", "NACIONAL", "LEMA", "LOCAL", "I<BR", "SERPRO", "SENATRAN")
-    out: List[str] = []
+    candidates: List[str] = []
 
     start_idx = None
     for i, ln in enumerate(lines):
@@ -323,8 +324,7 @@ def _find_filiacao(lines: List[str]) -> List[str]:
     if start_idx is None:
         return []
 
-    # Look ahead a bit; OCR sometimes repeats this block later, so keep it bounded.
-    for j in range(start_idx + 1, min(start_idx + 10, len(lines))):
+    for j in range(start_idx + 1, min(start_idx + 14, len(lines))):
         raw = lines[j]
         u = raw.upper()
         if any(m in u for m in stop_markers):
@@ -333,24 +333,29 @@ def _find_filiacao(lines: List[str]) -> List[str]:
         cleaned = _clean_filiacao_line(raw)
         if not cleaned:
             continue
-        if not _is_plausible_person_line(cleaned):
-            continue
 
-        # Avoid accidentally capturing the main name again
-        if "CARTEIRA" in cleaned or "HABILIT" in cleaned:
-            continue
+        if cleaned not in candidates:
+            candidates.append(cleaned)
 
-        out.append(cleaned)
-        if len(out) >= 2:
+        # não precisa varrer infinito
+        if len(candidates) >= 4:
             break
 
-    # Dedup
-    dedup: List[str] = []
-    for x in out:
-        if x not in dedup:
-            dedup.append(x)
+    if not candidates:
+        return []
 
-    return dedup
+    scored = sorted(((c, _score_parent_line(c)) for c in candidates), key=lambda x: x[1], reverse=True)
+    best, best_score = scored[0]
+
+    # pega o segundo só se for “quase tão bom quanto”
+    out = [best]
+    if len(scored) >= 2:
+        second, second_score = scored[1]
+        # threshold relativo: evita adicionar lixo
+        if second_score >= 0.70 * best_score and second_score >= 1.4:
+            out.append(second)
+
+    return out
 
 
 def analyze_cnh(raw_text: str, filename: str | None = None) -> Tuple[Dict[str, Any], Dict[str, Any]]:
