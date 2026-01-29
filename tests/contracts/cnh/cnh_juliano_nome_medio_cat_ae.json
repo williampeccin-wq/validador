@@ -1,0 +1,15 @@
+{
+  "filename": "cnh_juliano_nome_medio_cat_ae.pdf",
+  "expect": {
+    "categoria": "AE"
+  },
+  "forbid": {
+    "nome_suffix_tokens": ["EM"]
+  },
+  "min": {
+    "filiacao_len_at_least": 2
+  },
+  "contains": {
+    "filiacao_any": ["FANDARUFF"]
+  }
+}

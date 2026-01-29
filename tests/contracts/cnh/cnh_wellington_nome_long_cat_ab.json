@@ -1,0 +1,13 @@
+{
+  "filename": "cnh_wellington_nome_long_cat_ab.pdf",
+  "expect": {
+    "categoria": "AB",
+    "data_nascimento": "18/10/2004"
+  },
+  "contains": {
+    "filiacao_any": ["TALITA", "CARVALHO"]
+  },
+  "min": {
+    "filiacao_len_at_least": 2
+  }
+}

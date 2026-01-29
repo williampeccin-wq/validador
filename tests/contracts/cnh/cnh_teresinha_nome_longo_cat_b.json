@@ -1,0 +1,12 @@
+{
+  "filename": "cnh_teresinha_nome_longo_cat_b.pdf",
+  "expect": {
+    "categoria": "B"
+  },
+  "contains": {
+    "nome_all": ["TERESINHA", "APARECIDA"]
+  },
+  "min": {
+    "filiacao_len_at_least": 2
+  }
+}

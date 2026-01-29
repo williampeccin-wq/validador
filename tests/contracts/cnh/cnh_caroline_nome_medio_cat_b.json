@@ -1,0 +1,10 @@
+{
+  "filename": "cnh_caroline_nome_medio_cat_b.pdf",
+  "expect": {
+    "categoria": "B",
+    "data_nascimento": "29/01/1994"
+  },
+  "min": {
+    "filiacao_len_at_least": 2
+  }
+}

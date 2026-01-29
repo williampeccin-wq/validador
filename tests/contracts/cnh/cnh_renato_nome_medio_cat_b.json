@@ -1,0 +1,12 @@
+{
+  "filename": "cnh_renato_nome_medio_cat_b.pdf",
+  "expect": {
+    "categoria": "B"
+  },
+  "contains": {
+    "filiacao_any": ["ADRIANA", "JESUS"]
+  },
+  "min": {
+    "filiacao_len_at_least": 2
+  }
+}

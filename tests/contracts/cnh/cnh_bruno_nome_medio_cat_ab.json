@@ -1,0 +1,9 @@
+{
+  "filename": "cnh_bruno_nome_medio_cat_ab.pdf",
+  "expect": {
+    "categoria": "AB"
+  },
+  "min": {
+    "filiacao_len_at_least": 1
+  }
+}
