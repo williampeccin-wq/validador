@@ -156,74 +156,216 @@ def _normalize_categoria_token(tok: str) -> str:
     return t
 
 
-def _extract_categoria_from_lines(lines: list[str]) -> Optional[str]:
+def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, Any]] = None) -> Optional[str]:
     """
-    FIX CRÍTICO:
-    - Não pode "achar" categoria dentro do rótulo (CATEGORIA) nem em palavras vizinhas.
-    - Só aceita:
-      (1) valor logo após o rótulo na mesma linha (depois de ':' '-' etc),
-      (2) valor em uma das próximas linhas, desde que a linha seja curta/compatível.
+    Estratégia:
+      PASSO 0 (alto-confiável): procurar padrão "CPF + REGISTRO(11d) + CATEGORIA" na mesma linha
+      ou em 2 linhas concatenadas (linha i + i+1). Isso evita pegar letra 'E/A' perdida no lugar errado.
 
-    Isso elimina falso-positivo tipo pegar 'C' de 'CATEGORIA' ou 'E' de qualquer lugar.
+      Depois, cai no método do anchor "CAT HAB" (com lookahead) e por fim no fallback "CATEGORIA:".
     """
-    # regex do rótulo (variações comuns)
-    label_re = re.compile(r"\bCAT(?:\.|\b)|\bCATEG(?:ORIA)?\b", re.IGNORECASE)
+    if _dbg is not None:
+        _dbg.setdefault("categoria_debug", {})
+        _dbg["categoria_debug"].setdefault("hits", [])
+        _dbg["categoria_debug"].setdefault("fallback_hits", [])
+        _dbg["categoria_debug"].setdefault("chosen", None)
 
-    # 1) varre procurando o rótulo
-    for i, ln in enumerate(lines[:260]):
-        if not label_re.search(ln):
-            continue
+    # ----------------------------
+    # PASSO 0: CPF + REGISTRO + CATEGORIA
+    # ----------------------------
+    cpf_pat = r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"
+    reg_pat = r"\b\d{11}\b"
 
+    # Procurar 2 letras primeiro (AB/AC/AD/AE), depois 1 letra.
+    pat_2 = re.compile(rf"({cpf_pat}).*?({reg_pat}).*?\b(AB|AC|AD|AE)\b")
+    pat_1 = re.compile(rf"({cpf_pat}).*?({reg_pat}).*?\b(A|B|C|D|E)\b")
+
+    for i in range(min(len(lines), 260)):
+        l0 = lines[i]
+        l1 = _safe_get(lines, i + 1)
+        combo = _upper(l0 + " " + l1)
+
+        m2 = pat_2.search(combo)
+        if m2:
+            cand = m2.group(3)
+            if cand in _ALLOWED_CATEGORIAS:
+                if _dbg is not None:
+                    _dbg["categoria_debug"]["chosen"] = {
+                        "value": cand,
+                        "mode": "cpf_registro_categoria_2letters",
+                        "line": _upper(l0),
+                        "lookahead200": combo[:200],
+                    }
+                return cand
+
+        m1 = pat_1.search(combo)
+        if m1:
+            cand = m1.group(3)
+            if cand in _ALLOWED_CATEGORIAS:
+                # NÃO aceitar "A" se houver qualquer 2-letras no combo (mesmo distante)
+                if cand == "A" and re.search(r"\b(AB|AC|AD|AE)\b", combo):
+                    continue
+
+                if _dbg is not None:
+                    _dbg["categoria_debug"]["chosen"] = {
+                        "value": cand,
+                        "mode": "cpf_registro_categoria_1letter",
+                        "line": _upper(l0),
+                        "lookahead200": combo[:200],
+                    }
+                return cand
+
+    # ----------------------------
+    # PASSO 1+: Anchor CAT HAB (com lookahead)
+    # ----------------------------
+    def _is_placeholder_tail(t: str) -> bool:
+        if not t:
+            return False
+        eq = t.count("=")
+        letters = sum(1 for ch in t if "A" <= ch <= "Z")
+        return eq >= 2 and letters <= 2
+
+    for i, ln in enumerate(lines[:300]):
         u = _upper(ln)
 
-        # 1a) tenta extrair depois do rótulo na mesma linha
-        # ex: "CATEGORIA: AB" / "CAT. - AE" / "CAT AB"
-        # pega o trecho após a ocorrência do rótulo e um separador opcional
-        m = re.search(r"(?:\bCAT(?:\.)?\b|\bCATEG(?:ORIA)?\b)\s*[:\-]?\s*(.+)$", u)
-        if m:
-            tail = m.group(1).strip()
-            cand = _normalize_categoria_token(tail)
-            # às vezes tail contém outras coisas; então:
-            # - se for exatamente uma categoria válida, retorna
-            if cand in _ALLOWED_CATEGORIAS:
-                return cand
-            # - senão, tenta pegar um token curto no começo
-            m2 = re.match(r"^([A-E](?:[\s\-\.]*[B-E])?)\b", tail)
-            if m2:
-                cand2 = _normalize_categoria_token(m2.group(1))
-                if cand2 in _ALLOWED_CATEGORIAS:
-                    return cand2
+        if not re.search(r"\b9\b", u):
+            continue
+        if "CAT" not in u:
+            continue
+        if "HAB" not in u and "CATHAB" not in u.replace(" ", ""):
+            continue
+        if "REGIST" not in u:
+            continue
 
-        # 1b) tenta próxima(s) linha(s) com linha curta
-        # ex: linha seguinte é "AB" ou "A B"
-        for j in range(1, 5):
+        anchor_match = re.search(r"(CAT\s*HAB|CATHAB)", u)
+        if not anchor_match:
+            continue
+
+        tail = u[anchor_match.end() :]
+        tail80 = tail[:80]
+        tail25 = tail[:25]
+
+        if _dbg is not None:
+            _dbg["categoria_debug"]["hits"].append({"line": u, "tail80": tail80, "tail25": tail25})
+
+        # 1) Preferir 2 letras na própria linha
+        for m in re.finditer(r"\b(AB|AC|AD|AE)\b", tail80):
+            cand = m.group(1)
+            if cand in _ALLOWED_CATEGORIAS:
+                if _dbg is not None:
+                    _dbg["categoria_debug"]["chosen"] = {"value": cand, "mode": "cat_hab_2letters_same_line", "line": u}
+                return cand
+
+        next1 = _upper(_safe_get(lines, i + 1))
+        next2 = _upper(_safe_get(lines, i + 2))
+        lookahead = (tail + " " + next1 + " " + next2).strip()
+        lookahead200 = lookahead[:200]
+
+        tail_has_only_A = bool(re.search(r"\bA\b", tail25)) and not bool(
+            re.search(r"\b(B|C|D|E|AB|AC|AD|AE)\b", tail80)
+        )
+        if _is_placeholder_tail(tail25) or tail_has_only_A:
+            m2 = re.search(r"\b(AB|AC|AD|AE)\b", lookahead200)
+            if m2:
+                cand = m2.group(1)
+                if cand in _ALLOWED_CATEGORIAS:
+                    if _dbg is not None:
+                        _dbg["categoria_debug"]["chosen"] = {
+                            "value": cand,
+                            "mode": "cat_hab_2letters_lookahead",
+                            "line": u,
+                            "lookahead200": lookahead200,
+                        }
+                    return cand
+
+            m3 = re.search(r"\b(B|C|D|E)\b", lookahead200)
+            if m3:
+                cand = m3.group(1)
+                if cand in _ALLOWED_CATEGORIAS:
+                    if _dbg is not None:
+                        _dbg["categoria_debug"]["chosen"] = {
+                            "value": cand,
+                            "mode": "cat_hab_1letter_lookahead",
+                            "line": u,
+                            "lookahead200": lookahead200,
+                        }
+                    return cand
+
+        # 3) Só então aceitar 1 letra na própria linha
+        for m in re.finditer(r"\b(A|B|C|D|E)\b", tail25):
+            cand = m.group(1)
+            if cand in _ALLOWED_CATEGORIAS:
+                if _dbg is not None:
+                    _dbg["categoria_debug"]["chosen"] = {"value": cand, "mode": "cat_hab_1letter_same_line", "line": u}
+                return cand
+
+        # OCR pode separar "A B" ou "A-B"
+        m4 = re.search(r"\b([A-E])\s*[\-\.]?\s*([B-E])\b", lookahead200)
+        if m4:
+            cand2 = (m4.group(1) + m4.group(2)).upper()
+            if cand2 in _ALLOWED_CATEGORIAS:
+                if _dbg is not None:
+                    _dbg["categoria_debug"]["chosen"] = {"value": cand2, "mode": "cat_hab_pair_lookahead", "line": u}
+                return cand2
+
+        # fallback curto: próxima linha curtinha
+        for j in range(1, 4):
             nxt = _safe_get(lines, i + j)
             if not nxt:
                 continue
             nu = _upper(nxt)
-
-            # evita rodapé/MRZ e outras seções
             if "I<BR" in nu or "<<<" in nu or "ASSINADOR" in nu or "SERPRO" in nu:
                 break
-
-            # pega apenas se a linha for "curta o bastante" para ser valor
-            # (evita pegar 'E' perdido dentro de uma frase)
             stripped = re.sub(r"\s+", "", nu)
             if len(stripped) > 8:
                 continue
-
             cand3 = _normalize_categoria_token(nu)
             if cand3 in _ALLOWED_CATEGORIAS:
+                if _dbg is not None:
+                    _dbg["categoria_debug"]["chosen"] = {"value": cand3, "mode": "cat_hab_nextline_short", "line": nu}
                 return cand3
 
-            m3 = re.fullmatch(r"\s*([A-E])\s*[\-\.]?\s*([B-E])\s*", nu)
-            if m3:
-                cand4 = (m3.group(1) + m3.group(2)).upper()
-                if cand4 in _ALLOWED_CATEGORIAS:
-                    return cand4
+    # ----------------------------
+    # Fallback: "CATEGORIA: X"
+    # ----------------------------
+    for i, ln in enumerate(lines[:300]):
+        u = _upper(ln)
+        if "CATEG" not in u:
+            continue
 
-    # 2) fallback conservador: procurar "CATEGORIA: XX" no texto já em linhas não ajuda;
-    # se não achou via rótulo + valor, é melhor retornar None do que inventar.
+        if _dbg is not None:
+            _dbg["categoria_debug"]["fallback_hits"].append({"line": u})
+
+        m = re.search(r"\bCATEG(?:ORIA)?\b\s*[:\-]?\s*(.+)$", u)
+        if m:
+            tail = m.group(1).strip()
+            m2 = re.match(r"^([A-E](?:\s*[\-\.]?\s*[B-E])?)\b", tail)
+            if m2:
+                cand = _normalize_categoria_token(m2.group(1))
+                if cand in _ALLOWED_CATEGORIAS:
+                    if _dbg is not None:
+                        _dbg["categoria_debug"]["chosen"] = {"value": cand, "mode": "categ_label", "line": u}
+                    return cand
+            cand_inline = _normalize_categoria_token(tail)
+            if cand_inline in _ALLOWED_CATEGORIAS:
+                if _dbg is not None:
+                    _dbg["categoria_debug"]["chosen"] = {"value": cand_inline, "mode": "categ_label_inline", "line": u}
+                return cand_inline
+
+        for j in range(1, 4):
+            nxt = _safe_get(lines, i + j)
+            if not nxt:
+                continue
+            nu = _upper(nxt)
+            stripped = re.sub(r"\s+", "", nu)
+            if len(stripped) > 8:
+                continue
+            cand2 = _normalize_categoria_token(nu)
+            if cand2 in _ALLOWED_CATEGORIAS:
+                if _dbg is not None:
+                    _dbg["categoria_debug"]["chosen"] = {"value": cand2, "mode": "categ_nextline", "line": nu}
+                return cand2
+
     return None
 
 
@@ -323,7 +465,6 @@ def _extract_nome(lines: list[str]) -> Optional[str]:
     """
     candidates: list[str] = []
 
-    # 1) tenta âncora NOME
     for i, ln in enumerate(lines[:120]):
         u = _upper(ln)
         if "NOME" in u:
@@ -342,7 +483,6 @@ def _extract_nome(lines: list[str]) -> Optional[str]:
         candidates.sort(key=_name_candidate_score, reverse=True)
         return candidates[0]
 
-    # 2) fallback por score (primeiras linhas), evitando institucional
     scored: list[tuple[int, str]] = []
     for ln in lines[:90]:
         cand = _clean_person_name_line(ln)
@@ -353,7 +493,6 @@ def _extract_nome(lines: list[str]) -> Optional[str]:
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored[0][1]
 
-    # 3) MRZ
     return _extract_mrz_name(lines)
 
 
@@ -389,15 +528,8 @@ def _extract_after_label(line: str, label_regex: str) -> Optional[str]:
 
 
 def _extract_filiacao(lines: list[str], nome: Optional[str]) -> list[str]:
-    """
-    Estratégia determinística:
-      1) MAE/PAI explícitos, se existirem.
-      2) marcador FILIA* aproximado + próximas linhas plausíveis.
-      3) fallback: antes do MRZ, pega 2 melhores linhas plausíveis que não sejam o próprio nome.
-    """
     out: list[str] = []
 
-    # 1) MAE / PAI explícitos
     for ln in lines[:260]:
         mae = _extract_after_label(ln, r"\bM[ÃA]E\b\s*[:\-]?\s*")
         if mae and _is_plausible_filiacao_line(mae):
@@ -407,25 +539,21 @@ def _extract_filiacao(lines: list[str], nome: Optional[str]) -> list[str]:
         if pai and _is_plausible_filiacao_line(pai):
             out.append(pai)
 
-    # 2) marcador de filiação aproximado
     if not out:
         for i, ln in enumerate(lines[:260]):
             u = _upper(ln)
             letters = re.sub(r"[^A-ZÁÀÂÃÉÊÍÓÔÕÚÜÇ]", "", u)
 
-            # aceita FILIA/FILIACAO; e casos OCR tipo FITICAO
             is_filiacao_marker = ("FILIA" in letters) or ("FILIAC" in letters) or ("FILI" in letters and "AO" in letters)
             is_filiacao_marker = is_filiacao_marker or ("FI" in letters and "ICAO" in letters)
 
             if is_filiacao_marker:
-                # mesma linha
                 tail = re.split(r"(FILIA(?:ÇÃO|CAO)?|FILIACAO|FILIATION|FILIACION)", u, maxsplit=1)
                 if len(tail) >= 3:
                     cand = _clean_person_name_line(tail[-1])
                     if cand and _is_plausible_filiacao_line(cand):
                         out.append(cand)
 
-                # próximas linhas
                 for j in range(1, 9):
                     nxt = _safe_get(lines, i + j)
                     if not nxt:
@@ -441,7 +569,6 @@ def _extract_filiacao(lines: list[str], nome: Optional[str]) -> list[str]:
 
                 break
 
-    # 3) fallback: melhores candidatos antes do MRZ
     if not out:
         mrz_idx = None
         for i, ln in enumerate(lines):
@@ -461,7 +588,6 @@ def _extract_filiacao(lines: list[str], nome: Optional[str]) -> list[str]:
             if not _is_plausible_filiacao_line(cand):
                 continue
 
-            # evita pegar o próprio nome
             cand_toks = set(cand.split())
             overlap = len(cand_toks & nome_toks) if nome_toks else 0
             if nome_toks and overlap >= max(2, min(3, len(nome_toks))):
@@ -478,7 +604,6 @@ def _extract_filiacao(lines: list[str], nome: Optional[str]) -> list[str]:
                 if len(out) >= 2:
                     break
 
-    # dedup mantendo ordem
     dedup: list[str] = []
     seen = set()
     for x in out:
@@ -491,11 +616,6 @@ def _extract_filiacao(lines: list[str], nome: Optional[str]) -> list[str]:
 
 
 def _extract_nascimento_validade(text: str, dates: list[str]) -> tuple[Optional[str], Optional[str]]:
-    """
-    Regra simples:
-    - nascimento tende a ser a data mais antiga (>= 1900)
-    - validade tende a ser a data mais futura (>= 1900)
-    """
     if not dates:
         return None, None
 
@@ -531,9 +651,6 @@ def _extract_nascimento_validade(text: str, dates: list[str]) -> tuple[Optional[
 
 
 def _extract_naturalidade(lines: list[str]) -> tuple[Optional[str], Optional[str]]:
-    """
-    Busca NATURALIDADE / MUNICÍPIO / UF.
-    """
     for i, ln in enumerate(lines):
         u = _upper(ln)
         if "NATURAL" in u:
@@ -564,9 +681,6 @@ def analyze_cnh(
     filename: Optional[str] = None,
     **_kwargs: Any,
 ) -> tuple[dict, dict]:
-    """
-    Retorna: (fields, debug)
-    """
     text = raw_text or ""
     lines = _strip_noise_lines(text.splitlines())
 
@@ -577,7 +691,7 @@ def analyze_cnh(
     data_nasc, validade = _extract_nascimento_validade(text, dates)
 
     nome = _extract_nome(lines)
-    categoria = _extract_categoria_from_lines(lines)  # << FIX: determinístico e sem falso positivo
+    categoria = _extract_categoria_from_lines(lines, _dbg=dbg)
     filiacao = _extract_filiacao(lines, nome)
 
     cidade, uf = _extract_naturalidade(lines)
