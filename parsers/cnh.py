@@ -76,6 +76,61 @@ _INSTITUTIONAL_TOKENS = {
 }
 
 
+# Tokens típicos de *labels/campos* (PT/EN/ES) que NÃO podem virar nome.
+# Cobre o problema relatado: capturar headers multilíngues como se fossem nomes.
+_FIELD_LABEL_NOISE_TOKENS = {
+    # PT
+    "LOCAL",
+    "NASCIMENTO",
+    "NATURALIDADE",
+    "DATA",
+    "EMISSÃO",
+    "EMISSAO",
+    "VALIDADE",
+    "FILIACAO",
+    "FILIAÇÃO",
+    "FILIA",
+    "MAE",
+    "MÃE",
+    "PAI",
+    "PERMISSAO",
+    "PERMISSÃO",
+    "REGISTRO",
+    "RENACH",
+    "CPF",
+    "DOC",
+    "DOCUMENTO",
+    "IDENTIDADE",
+    "ORGAO",
+    "ÓRGÃO",
+    "EMISSOR",
+    "CATEGORIA",
+    "CAT",
+    "HAB",
+    # EN/ES
+    "DATE",
+    "PLACE",
+    "BIRTH",
+    "NATIONALITY",
+    "ISSUE",
+    "EXPIRY",
+    "EXPIRATION",
+    "VALID",
+    "FILIATION",
+    "FILIACION",
+}
+
+
+def _contains_field_label_noise(s: str) -> bool:
+    u = _upper(_strip_leading_enum(s))
+    if not u:
+        return False
+    for tok in _FIELD_LABEL_NOISE_TOKENS:
+        if tok in u:
+            return True
+    return False
+
+
 def _contains_institutional_noise(s: str) -> bool:
     u = _upper(_strip_leading_enum(s))
     if not u:
@@ -299,38 +354,12 @@ def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, 
                     _dbg["categoria_debug"]["chosen"] = {"value": cand, "mode": "cat_hab_1letter_same_line", "line": u}
                 return cand
 
-        # OCR pode separar "A B" ou "A-B"
-        m4 = re.search(r"\b([A-E])\s*[\-\.]?\s*([B-E])\b", lookahead200)
-        if m4:
-            cand2 = (m4.group(1) + m4.group(2)).upper()
-            if cand2 in _ALLOWED_CATEGORIAS:
-                if _dbg is not None:
-                    _dbg["categoria_debug"]["chosen"] = {"value": cand2, "mode": "cat_hab_pair_lookahead", "line": u}
-                return cand2
-
-        # fallback curto: próxima linha curtinha
-        for j in range(1, 4):
-            nxt = _safe_get(lines, i + j)
-            if not nxt:
-                continue
-            nu = _upper(nxt)
-            if "I<BR" in nu or "<<<" in nu or "ASSINADOR" in nu or "SERPRO" in nu:
-                break
-            stripped = re.sub(r"\s+", "", nu)
-            if len(stripped) > 8:
-                continue
-            cand3 = _normalize_categoria_token(nu)
-            if cand3 in _ALLOWED_CATEGORIAS:
-                if _dbg is not None:
-                    _dbg["categoria_debug"]["chosen"] = {"value": cand3, "mode": "cat_hab_nextline_short", "line": nu}
-                return cand3
-
     # ----------------------------
-    # Fallback: "CATEGORIA: X"
+    # PASSO 2: fallback label direto
     # ----------------------------
-    for i, ln in enumerate(lines[:300]):
+    for i, ln in enumerate(lines[:260]):
         u = _upper(ln)
-        if "CATEG" not in u:
+        if "CATEG" not in u and "CAT" not in u:
             continue
 
         if _dbg is not None:
@@ -402,6 +431,10 @@ def _is_plausible_fullname(s: str) -> bool:
     if _contains_institutional_noise(s0):
         return False
 
+    # Evita capturar labels multilíngues ("LOCAL DE NASCIMENTO / DATE AND PLACE", etc.) como nome.
+    if _contains_field_label_noise(s0):
+        return False
+
     toks = s0.split()
     if len(toks) < 2:
         return False
@@ -420,6 +453,9 @@ def _name_candidate_score(line: str) -> int:
     if _contains_institutional_noise(s):
         return -10**7
 
+    if _contains_field_label_noise(s):
+        return -10**7
+
     toks = s.split()
     if len(toks) < 2:
         return -10**6
@@ -428,6 +464,7 @@ def _name_candidate_score(line: str) -> int:
     score += min(len(toks), 7) * 10
     score += int(_alpha_ratio_letters_only(s) * 40)
 
+    # bônus por partículas típicas
     for p in ("DA", "DE", "DO", "DOS", "DAS"):
         if p in toks:
             score += 4
@@ -441,14 +478,28 @@ def _extract_mrz_name(lines: list[str]) -> Optional[str]:
     Fallback crítico: muitos PDFs exportados trazem o nome mais "limpo"
     na linha MRZ (ex.: "BRUNO<<LIMA<CARNEIRO<<<<<<<<<<").
     """
-    for ln in lines[-160:]:
+    # Procura do fim para o começo (em PDFs exportados, MRZ costuma estar no rodapé).
+    # Regra determinística: precisa ter o padrão SOBRENOME<<NOME(s).
+    for ln in reversed(lines[-220:]):
         if "<<" not in ln:
             continue
+
         u = _upper(ln)
         if not re.search(r"[A-Z]{2,}<<[A-Z]", u):
             continue
 
-        cand = u.replace("<", " ")
+        # Alguns OCRs duplicam a MRZ ou trazem lixo no começo; pega apenas o maior bloco com '<<'.
+        blocks = [b for b in re.split(r"\s+", u) if "<<" in b]
+        candidate_block = max(blocks, key=len) if blocks else u
+
+        # Normaliza: SOBRENOME<<NOMES<... -> "SOBRENOME NOMES"
+        if "<<" in candidate_block:
+            left, right = candidate_block.split("<<", 1)
+            right = right.replace("<", " ")
+            cand = f"{left} {right}"
+        else:
+            cand = candidate_block.replace("<", " ")
+
         cand = _clean_person_name_line(cand)
         if _is_plausible_fullname(cand):
             return cand
@@ -458,33 +509,82 @@ def _extract_mrz_name(lines: list[str]) -> Optional[str]:
 
 def _extract_nome(lines: list[str]) -> Optional[str]:
     """
-    Estratégia (mínima e determinística):
-    1) Contexto de 'NOME' quando houver.
-    2) Fallback: melhor candidato por score no bloco superior.
-    3) Fallback final: MRZ (linha com '<<').
+    Estratégia (determinística e auditável):
+    0) MRZ (<<) quando presente e plausível. (Maior confiabilidade nos PDFs exportados.)
+    1) Campo imediatamente após label de nome ("NOME", "NOME E SOBRENOME", "NOME CIVIL", "NAME").
+    2) Fallback: melhor candidato por score (após filtros anti-label/institucional).
     """
+    # 0) MRZ primeiro
+    mrz = _extract_mrz_name(lines)
+    if mrz:
+        return mrz
+
     candidates: list[str] = []
 
-    for i, ln in enumerate(lines[:120]):
-        u = _upper(ln)
-        if "NOME" in u:
-            after = re.split(r"\bNOME\b[:\-]?\s*", u, maxsplit=1)
-            if len(after) == 2:
-                cand = _clean_person_name_line(after[1])
-                if _is_plausible_fullname(cand):
-                    candidates.append(cand)
+    # 1) Label de nome -> linha seguinte / inline
+    # Nota: percorre um pouco mais para cobrir variações (alguns PDFs repetem blocos).
+    name_label_re = re.compile(
+        r"\b(NOME\s+E\s+SOBRENOME|NOME\s+CIVIL|NOME|NAME)\b\s*[:\-]?\s*(.*)$"
+    )
 
-            nxt = _safe_get(lines, i + 1)
+    # tokens que, se aparecerem na MESMA linha do label, indicam header multi-campo (rejeitar)
+    label_line_reject = {
+        "LOCAL",
+        "NASCIMENTO",
+        "DATE",
+        "PLACE",
+        "BIRTH",
+        "NATURALIDADE",
+        "FILIAC",
+        "CPF",
+        "CAT",
+        "HAB",
+        "REGISTRO",
+    }
+
+    for i, ln in enumerate(lines[:220]):
+        u = _upper(ln)
+        if "NOME" not in u and "NAME" not in u:
+            continue
+
+        # Se a linha parece um header cheio de outros campos, rejeita.
+        if any(tok in u for tok in label_line_reject) and not u.strip().startswith("NOME") and not u.strip().startswith("NAME"):
+            continue
+
+        m = name_label_re.search(u)
+        if not m:
+            continue
+
+        tail = m.group(2) or ""
+        cand_inline = _clean_person_name_line(tail)
+        if cand_inline and _is_plausible_fullname(cand_inline):
+            candidates.append(cand_inline)
+
+        # Próximas linhas (primeira que não é outro label)
+        for j in (1, 2, 3):
+            nxt = _upper(_safe_get(lines, i + j))
+            if not nxt:
+                continue
+            # Evita cair em "NOME CIVIL"/"CPF" etc.
+            if name_label_re.search(nxt) and ("NOME" in nxt or "NAME" in nxt):
+                continue
+            if _contains_institutional_noise(nxt) or _contains_field_label_noise(nxt):
+                continue
             cand2 = _clean_person_name_line(nxt)
             if _is_plausible_fullname(cand2):
                 candidates.append(cand2)
+                break
 
     if candidates:
         candidates.sort(key=_name_candidate_score, reverse=True)
         return candidates[0]
 
+    # 2) Fallback por score (com filtros já embutidos em _is_plausible_fullname)
     scored: list[tuple[int, str]] = []
-    for ln in lines[:90]:
+    for ln in lines[:140]:
+        # Rejeita linhas muito longas: geralmente são frases institucionais ou blocos concatenados.
+        if len(_upper(ln)) > 90:
+            continue
         cand = _clean_person_name_line(ln)
         if _is_plausible_fullname(cand):
             scored.append((_name_candidate_score(cand), cand))
@@ -493,7 +593,7 @@ def _extract_nome(lines: list[str]) -> Optional[str]:
         scored.sort(key=lambda x: x[0], reverse=True)
         return scored[0][1]
 
-    return _extract_mrz_name(lines)
+    return None
 
 
 def _is_plausible_filiacao_line(s: str) -> bool:
