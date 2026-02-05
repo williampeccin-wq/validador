@@ -127,13 +127,37 @@ def _load_parser_for(dt: DocumentType):
 
 
 def _invoke_parser(parser_fn, *, raw_text: str, filename: str) -> Tuple[Dict[str, Any] | None, Dict[str, Any] | None, Dict[str, Any] | None]:
+    """
+    Contrato suportado (compatível):
+      - dict
+      - (fields, dbg)
+      - (fields, dbg, parse_error)
+    """
     try:
         try:
-            fields, p_dbg = parser_fn(raw_text=raw_text, filename=filename)
+            ret = parser_fn(raw_text=raw_text, filename=filename)
         except TypeError:
-            fields = parser_fn(raw_text)
-            p_dbg = {}
-        return (fields or {}), (p_dbg or {}), None
+            # compat com parsers antigos: parser_fn(raw_text)
+            ret = parser_fn(raw_text)
+
+        # Normaliza retornos
+        parse_error = None
+        p_dbg: Dict[str, Any] = {}
+
+        if isinstance(ret, tuple):
+            if len(ret) == 3:
+                fields, p_dbg, parse_error = ret
+            elif len(ret) == 2:
+                fields, p_dbg = ret
+            elif len(ret) == 1:
+                fields = ret[0]
+            else:
+                raise TypeError(f"Parser returned tuple of unsupported length: {len(ret)}")
+        else:
+            fields = ret
+
+        return (fields or {}), (p_dbg or {}), (parse_error or None)
+
     except Exception as e:
         err = {
             "type": "ParserError",
