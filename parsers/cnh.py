@@ -780,7 +780,7 @@ def analyze_cnh(
     *,
     filename: Optional[str] = None,
     **_kwargs: Any,
-) -> tuple[dict, dict]:
+) -> tuple[dict, dict, Optional[dict]]:
     text = raw_text or ""
     lines = _strip_noise_lines(text.splitlines())
 
@@ -807,12 +807,57 @@ def analyze_cnh(
         "filiacao": filiacao,
     }
 
+    # ----------------------------
+    # Hard checks (não bloqueia; reporta parse_error)
+    # ----------------------------
+    missing: list[str] = []
+    invalid: list[str] = []
+
+    # Nome
+    if not (nome and isinstance(nome, str) and _is_plausible_fullname(nome)):
+        missing.append("nome")
+
+    # CPF
+    if not (cpf and isinstance(cpf, str) and len(cpf) == 11 and cpf.isdigit()):
+        missing.append("cpf")
+
+    # Datas
+    if not (data_nasc and re.match(r"^\d{2}/\d{2}/\d{4}$", data_nasc)):
+        missing.append("data_nascimento")
+    if not (validade and re.match(r"^\d{2}/\d{2}/\d{4}$", validade)):
+        missing.append("validade")
+
+    # Categoria
+    if not (categoria and categoria in _ALLOWED_CATEGORIAS):
+        missing.append("categoria")
+
+    # Filiação (best-effort; mas audita)
+    if filiacao is None:
+        invalid.append("filiacao:null")
+    else:
+        if not isinstance(filiacao, list):
+            invalid.append("filiacao:not_list")
+        else:
+            if len(filiacao) == 0:
+                invalid.append("filiacao:empty")
+
+    parse_error: Optional[dict] = None
+    if missing or invalid:
+        parse_error = {
+            "type": "ParserError",
+            "code": "CNH_REQUIRED_FIELDS_MISSING_OR_INVALID",
+            "message": "CNH parse incomplete (non-blocking).",
+            "missing": missing,
+            "invalid": invalid,
+        }
+
     dbg.update(
         {
             "found_dates": dates,
             "found_cpfs": _find_all_cpfs(text),
             "extracted": {k: fields.get(k) for k in ["nome", "cpf", "categoria", "data_nascimento", "validade"]},
+            "parse_error": parse_error,
         }
     )
 
-    return fields, dbg
+    return fields, dbg, parse_error
