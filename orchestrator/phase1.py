@@ -9,7 +9,7 @@ import re
 import traceback
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -346,7 +346,7 @@ def _doc_payload(
             "document_type": dt.value,
             "filename": raw.filename,
             "mime_type": raw.mime_type,
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00","Z"),
             "raw_b64_len": len(raw.content_b64 or ""),
         },
         "raw": {
