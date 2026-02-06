@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import os
@@ -14,12 +15,20 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-_STORAGE_ROOT = Path("storage")
+_STORAGE_ROOT = Path("storage/phase1")
 
 
-def _set_storage_root(root: str | Path) -> None:
+def _resolve_storage_root() -> Path:
+    return Path(os.getenv("PHASE1_STORAGE_ROOT", str(_STORAGE_ROOT)))
+
+
+
+def _set_storage_root(root: str | Path | None = None) -> None:
     global _STORAGE_ROOT
-    _STORAGE_ROOT = Path(root)
+    if root is None:
+        _STORAGE_ROOT = _resolve_storage_root()
+    else:
+        _STORAGE_ROOT = Path(root)
 
 
 def _env_truthy(name: str, default: str = "0") -> bool:
@@ -41,7 +50,7 @@ class RawPayload:
     filename: str
     mime_type: str
     content_b64: str
-
+    sha256: str
 
 def _guess_mime_type(filename: str) -> str:
     fn = (filename or "").lower()
@@ -61,11 +70,12 @@ def _read_file_as_raw_payload(file_path: str) -> RawPayload:
         filename=p.name,
         mime_type=_guess_mime_type(p.name),
         content_b64=base64.b64encode(b).decode("ascii"),
+        sha256=hashlib.sha256(b).hexdigest(),
     )
 
 
 def _phase1_case_dir(case_id: str) -> Path:
-    return _STORAGE_ROOT / "phase1" / case_id
+    return _STORAGE_ROOT / case_id
 
 
 def _phase1_doc_dir(case_id: str, dt: "DocumentType") -> Path:
@@ -77,8 +87,7 @@ def _ensure_dir(p: Path) -> None:
 
 
 def start_case(storage_root: str | Path | None = None) -> str:
-    if storage_root is not None:
-        _set_storage_root(storage_root)
+    _set_storage_root(storage_root)
     case_id = str(uuid.uuid4())
     _ensure_dir(_phase1_case_dir(case_id))
     return case_id
@@ -96,6 +105,7 @@ class DocumentType(str, Enum):
 
     HOLERITE = "holerite"
     FOLHA = "folha"
+    FOLHA_PAGAMENTO = "folha"
     EXTRATO_BANCARIO = "extrato_bancario"
 
 
@@ -353,10 +363,13 @@ def _extract_text_cnh_best(file_path: str, raw: RawPayload, *, analyze_cnh_fn=No
     return best_text or "", dbg
 
 
+
 def _doc_payload(
     *,
     dt: DocumentType,
     doc_id: str,
+    case_id: str,
+    raw_sha256: str,
     raw: RawPayload,
     raw_text: str,
     parsed: Dict[str, Any] | None,
@@ -365,6 +378,10 @@ def _doc_payload(
     parser_debug: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
     return {
+    "case_id": case_id,
+        # Top-level compat (tests)
+        "doc_id": doc_id,
+        "document_type": dt.value,
         "meta": {
             "doc_id": doc_id,
             "document_type": dt.value,
@@ -376,6 +393,8 @@ def _doc_payload(
         "raw": {
             "filename": raw.filename,
             "mime_type": raw.mime_type,
+            "sha256": raw_sha256,
+            "sha256": raw.sha256,
             "content_b64": raw.content_b64,
         },
         "raw_text": raw_text,
@@ -388,6 +407,7 @@ def _doc_payload(
     }
 
 
+
 def collect_document(
     case_id: str,
     file_path: str,
@@ -395,13 +415,13 @@ def collect_document(
     document_type: str | DocumentType,
     storage_root: str | Path | None = None,
 ) -> Dict[str, Any]:
-    if storage_root is not None:
-        _set_storage_root(storage_root)
+    _set_storage_root(storage_root)
 
     dt = DocumentType(document_type) if not isinstance(document_type, DocumentType) else document_type
     doc_id = str(uuid.uuid4())
 
     raw = _read_file_as_raw_payload(file_path)
+    raw_sha256 = hashlib.sha256(base64.b64decode(raw.content_b64)).hexdigest()
 
     parsed: Optional[Dict[str, Any]] = None
     parse_error: Optional[Dict[str, Any]] = None
@@ -473,6 +493,8 @@ def collect_document(
         dt=dt,
         doc_id=doc_id,
         raw=raw,
+    case_id=case_id,
+    raw_sha256=raw_sha256,
         raw_text=raw_text or "",
         parsed=parsed,
         parse_error=parse_error,
@@ -482,3 +504,70 @@ def collect_document(
 
     out_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), encoding="utf-8")
     return doc
+# ======================================================================================
+# Gate 1 / Case status (public API expected by tests)
+
+
+@dataclass(frozen=True)
+class CaseStatus:
+    is_complete: bool
+    missing: list[str]
+    doc_counts: dict[str, int]
+
+# ======================================================================================
+
+def _list_case_doc_types(case_id: str) -> dict[str, int]:
+    """
+    Retorna contagem de JSONs persistidos por document_type dentro de storage/phase1/<case_id>/.
+    Determinístico e sem dependência de memória em runtime.
+    """
+    base = _phase1_case_dir(case_id)
+    out: dict[str, int] = {}
+    if not base.exists():
+        return out
+
+    for p in base.iterdir():
+        if not p.is_dir():
+            continue
+        # conta apenas .json persistidos (um por doc coletado)
+        out[p.name] = len(list(p.glob("*.json")))
+    return out
+
+
+def gate1_is_ready(case_id: str, *, storage_root: str | Path | None = None) -> bool:
+    """
+    Gate 1: mínimo necessário para avançar (proposta + CNH).
+    Regra:
+      - PROPOSTA_DAYCOVAL precisa existir
+      - CNH pode ser 'cnh' OU 'cnh_senatran' (compat)
+    """
+    if storage_root is not None:
+        _set_storage_root(storage_root)
+
+    counts = _list_case_doc_types(case_id)
+    has_proposta = counts.get(DocumentType.PROPOSTA_DAYCOVAL.value, 0) > 0
+    has_cnh = (counts.get(DocumentType.CNH.value, 0) > 0) or (counts.get(DocumentType.CNH_SENATRAN.value, 0) > 0)
+    return bool(has_proposta and has_cnh)
+
+
+def case_status(case_id: str, *, storage_root: str | Path | None = None) -> CaseStatus:
+    """
+    Status consolidado do case com foco em Gate 1.
+    Não bloqueia parsing/validação: só reporta presença/ausência de documentos.
+    """
+    if storage_root is not None:
+        _set_storage_root(storage_root)
+
+    counts = _list_case_doc_types(case_id)
+
+    # Gate 1 required
+    missing: list[str] = []
+    if counts.get(DocumentType.PROPOSTA_DAYCOVAL.value, 0) <= 0:
+        missing.append(DocumentType.PROPOSTA_DAYCOVAL.value)
+
+    if (counts.get(DocumentType.CNH.value, 0) <= 0) and (counts.get(DocumentType.CNH_SENATRAN.value, 0) <= 0):
+        missing.append(DocumentType.CNH.value)
+
+    ready = (len(missing) == 0)
+
+    return CaseStatus(is_complete=ready, missing=missing, doc_counts=counts)
