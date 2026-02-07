@@ -1,5 +1,64 @@
 from __future__ import annotations
 
+
+# --- WQ CNH postprocess helpers (v1) ---
+_WQ_CNH_FILIACAO_BAD_TOKENS = {
+    "FILIATION", "FILIACIÓN", "OBSERVAÇÕES", "OBSERVATIONS", "OBSERVACIONES",
+    "LOCAL", "PLACE", "LUGAR", "NATURALIDADE", "NASCIMENTO", "DATA", "VALIDADE",
+}
+
+
+def _wq_is_glossary_noise_line(line: str) -> bool:
+    t = (line or "").strip()
+    if not t:
+        return True
+    up = t.upper()
+    # linha muito "título"/glossário multilingue
+    hits = sum(1 for tok in _WQ_CNH_FILIACAO_BAD_TOKENS if tok in up)
+    if hits >= 2:
+        return True
+    # linhas com poucos chars úteis e muito ruído
+    if len(up) < 6:
+        return True
+    return False
+
+
+def _wq_cleanup_filiacao(filiacao):
+    if not filiacao:
+        return []
+    out = []
+    for x in filiacao:
+        x = (x or "").strip()
+        if not x:
+            continue
+        if _wq_is_glossary_noise_line(x):
+            continue
+        # remove "lixos" curtos que aparecem como restos de OCR (ex: AAA OER, MAS FIO, ADA THE)
+        toks = x.split()
+        if len(toks) <= 2 and any(len(t) <= 3 for t in toks):
+            continue
+        out.append(x)
+    # dedupe preservando ordem
+    seen = set()
+    out2 = []
+    for x in out:
+        k = x.upper()
+        if k in seen:
+            continue
+        seen.add(k)
+        out2.append(x)
+    return out2
+
+
+def _wq_postprocess_out(out: dict) -> dict:
+    # não quebra se out não for dict esperado
+    if not isinstance(out, dict):
+        return out
+    if "filiacao" in out:
+        out["filiacao"] = _wq_cleanup_filiacao(out.get("filiacao"))
+    return out
+# --- end WQ helpers ---
+
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -12,6 +71,60 @@ from typing import Any, Optional
 _RE_DATE = re.compile(r"\b(\d{2}/\d{2}/\d{4})\b")
 _RE_CPF = re.compile(r"\b(\d{3}\.?(?:\d{3})\.?(?:\d{3})-?\d{2})\b")
 _RE_CPF_DIGITS = re.compile(r"\D+")
+
+
+def _wq_wrap_return_v1(*ret):
+    """
+    Envelopa retornos de analyze_cnh para aplicar pós-processamento sem depender
+    do formato (dict, tuple/list com dict na pos 0, etc.).
+
+    Aceita:
+      - dict
+      - (fields, dbg, parse_error)  -> tuple
+      - (dict, ...) ou [dict, ...]
+    """
+    try:
+        # chamada comum: _wq_wrap_return_v1(fields, dbg, parse_error)
+        if len(ret) == 3 and isinstance(ret[0], dict):
+            fields, dbg, parse_error = ret
+            return (_wq_postprocess_out(fields), dbg, parse_error)
+
+        # chamada antiga: _wq_wrap_return_v1(dict)
+        if len(ret) == 1:
+            r0 = ret[0]
+            if isinstance(r0, dict):
+                return _wq_postprocess_out(r0)
+            if isinstance(r0, (tuple, list)) and r0:
+                first = r0[0]
+                if isinstance(first, dict):
+                    first2 = _wq_postprocess_out(first)
+                    if isinstance(r0, tuple):
+                        return (first2, *r0[1:])
+                    r0b = list(r0)
+                    r0b[0] = first2
+                    return r0b
+            return r0
+
+        # fallback: devolve como tuple
+        if isinstance(ret, tuple) and ret and isinstance(ret[0], dict):
+            return (_wq_postprocess_out(ret[0]), *ret[1:])
+    except Exception:
+        # nunca quebra pipeline por pós-processamento
+        pass
+
+    return ret if len(ret) != 1 else ret[0]
+
+
+# >>> WQ ADD
+_WQ__OLD_WRAP_RETURN_V1 = _wq_wrap_return_v1
+
+
+def _wq_wrap_return_v1(*ret):
+    out = _WQ__OLD_WRAP_RETURN_V1(*ret)
+    if isinstance(out, tuple) and len(out) == 3 and isinstance(out[0], dict) and isinstance(out[1], dict):
+        return (out[0], out[1])
+    return out
+# <<< WQ ADD
 
 
 def _only_digits(s: str) -> str:
@@ -174,9 +287,13 @@ def _pick_best_cpf(text: str) -> Optional[str]:
     return candidates[0] if candidates else None
 
 
+_UF_SET = {'AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'}
+
+
 def _looks_like_state_uf(tok: str) -> bool:
     tok = _upper(tok)
-    return bool(re.fullmatch(r"[A-Z]{2}", tok))
+    tok = re.sub(r"[^A-Z]", "", tok)
+    return tok in _UF_SET
 
 
 def _safe_get(lines: list[str], idx: int) -> str:
@@ -751,25 +868,64 @@ def _extract_nascimento_validade(text: str, dates: list[str]) -> tuple[Optional[
 
 
 def _extract_naturalidade(lines: list[str]) -> tuple[Optional[str], Optional[str]]:
+    """Best-effort extraction of (cidade, UF) for naturalidade.
+
+    CNH exportada do app costuma trazer a naturalidade no bloco:
+    "DATA, LOCAL E UF DE NASCIMENTO" e o valor no formato:
+        DD/MM/AAAA, CIDADE, UF
+
+    Alguns OCRs também trazem "NATURALIDADE".
+
+    Regras:
+    - Nunca inventa: só retorna se encontrar UF válida (whitelist) e cidade plausível.
+    - Determinístico: baseado em âncoras e regex, sem heurísticas probabilísticas.
+    """
+
+    def _extract_from_text(txt: str) -> tuple[Optional[str], Optional[str]]:
+        u = _upper(txt)
+        # Padrão principal: data, cidade, UF (com vírgulas)
+        m = re.search(
+            r"\b(\d{2}[/-]\d{2}[/-]\d{4})\s*,\s*([A-ZÀ-Ú][A-ZÀ-Ú\s'\-\.]{2,}?)\s*,\s*([A-Z]{2})\b",
+            u,
+        )
+        if not m:
+            return None, None
+        cidade = _norm_spaces(m.group(2)).strip(" \t\"'|.,;-_")
+        uf = re.sub(r"[^A-Z]", "", m.group(3))
+        if not uf or uf not in _UF_SET:
+            return None, None
+        if not cidade or len(cidade) < 3:
+            return None, None
+        if _alpha_ratio_letters_only(cidade) < 0.6:
+            return None, None
+        return cidade, uf
+
     for i, ln in enumerate(lines):
         u = _upper(ln)
+
+        # 1) Âncora forte do bloco de naturalidade (OCR pode distorcer, então é por contains)
+        if ("LOCAL" in u and "UF" in u and "NASC" in u):
+            chunk = "\n".join([ln, _safe_get(lines, i + 1), _safe_get(lines, i + 2)])
+            cidade, uf = _extract_from_text(chunk)
+            if cidade and uf:
+                return cidade, uf
+
+        # 2) Fallback: NATURALIDADE / NATURAL
         if "NATURAL" in u:
             tail = re.split(r"NATURAL(?:IDADE)?\s*[:\-]?\s*", u, maxsplit=1)
-            cand = _upper(tail[1]) if len(tail) == 2 else ""
+            cand = tail[1] if len(tail) == 2 else ""
+            chunk = "\n".join([cand, _safe_get(lines, i + 1), _safe_get(lines, i + 2)])
+            cidade, uf = _extract_from_text(chunk)
+            if cidade and uf:
+                return cidade, uf
 
-            toks = cand.split()
-            if len(toks) >= 2 and _looks_like_state_uf(toks[-1]):
-                uf = toks[-1]
-                cidade = " ".join(toks[:-1]).strip()
-                if cidade:
-                    return cidade, uf
-
-            nxt = _upper(_safe_get(lines, i + 1))
-            toks = nxt.split()
-            if len(toks) >= 2 and _looks_like_state_uf(toks[-1]):
-                uf = toks[-1]
-                cidade = " ".join(toks[:-1]).strip()
-                if cidade:
+            # ainda assim: alguns OCRs trazem "CIDADE, UF" sem data
+            u2 = _upper(_safe_get(lines, i + 1))
+            m2 = re.search(r"\b([A-ZÀ-Ú][A-ZÀ-Ú\s'\-\.]{2,}?)\s*,\s*([A-Z]{2})\b", u2)
+            if m2:
+                cidade = _norm_spaces(m2.group(1)).strip(" \t\"'|.,;-_")
+                uf = re.sub(r"[^A-Z]", "", m2.group(2))
+                if uf in _UF_SET and cidade and _alpha_ratio_letters_only(cidade) >= 0.6:
                     return cidade, uf
 
     return None, None
@@ -780,7 +936,7 @@ def analyze_cnh(
     *,
     filename: Optional[str] = None,
     **_kwargs: Any,
-) -> tuple[dict, dict, Optional[dict]]:
+) -> tuple[dict, dict]:
     text = raw_text or ""
     lines = _strip_noise_lines(text.splitlines())
 
@@ -860,4 +1016,4 @@ def analyze_cnh(
         }
     )
 
-    return fields, dbg, parse_error
+    return _wq_wrap_return_v1(fields, dbg, parse_error)
