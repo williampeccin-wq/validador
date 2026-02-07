@@ -287,7 +287,7 @@ def _pick_best_cpf(text: str) -> Optional[str]:
     return candidates[0] if candidates else None
 
 
-_UF_SET = {'AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS','MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO'}
+_UF_SET = {'AC', 'AL', 'AP', 'AM', 'BA', 'CE', 'DF', 'ES', 'GO', 'MA', 'MT', 'MS', 'MG', 'PA', 'PB', 'PR', 'PE', 'PI', 'RJ', 'RN', 'RS', 'RO', 'RR', 'SC', 'SP', 'SE', 'TO'}
 
 
 def _looks_like_state_uf(tok: str) -> bool:
@@ -413,7 +413,7 @@ def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, 
         if not anchor_match:
             continue
 
-        tail = u[anchor_match.end() :]
+        tail = u[anchor_match.end():]
         tail80 = tail[:80]
         tail25 = tail[:25]
 
@@ -739,7 +739,7 @@ def _extract_after_label(line: str, label_regex: str) -> Optional[str]:
     m = re.search(label_regex, u)
     if not m:
         return None
-    tail = u[m.end() :]
+    tail = u[m.end():]
     tail = _clean_person_name_line(tail)
     return tail or None
 
@@ -918,6 +918,17 @@ def _extract_naturalidade(lines: list[str]) -> tuple[Optional[str], Optional[str
             cidade, uf = _extract_from_text(chunk)
             if cidade and uf:
                 return cidade, uf
+
+            # >>> WQ ADD
+            # padrão sem vírgula e sem data: "CIDADE UF"
+            cand_u = _upper(cand)
+            m_inline = re.search(r"\b([A-ZÀ-Ú][A-ZÀ-Ú\s'\-\.]{2,}?)\s+([A-Z]{2})\b", cand_u)
+            if m_inline:
+                cidade2 = _norm_spaces(m_inline.group(1)).strip(" \t\"'|.,;-_")
+                uf2 = re.sub(r"[^A-Z]", "", m_inline.group(2))
+                if uf2 in _UF_SET and cidade2 and _alpha_ratio_letters_only(cidade2) >= 0.6:
+                    return cidade2, uf2
+            # <<< WQ ADD
 
             # ainda assim: alguns OCRs trazem "CIDADE, UF" sem data
             u2 = _upper(_safe_get(lines, i + 1))
