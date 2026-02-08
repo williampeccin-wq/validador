@@ -20,3 +20,9 @@ validador.zip
 scripts/smoke_cnh_debug_one.py
 scripts/smoke_cnh_fixtures_folder.py
 scripts/smoke_cnh_quality_fixtures.py
+
+# local runtime artifacts
+.wq_tmp_cnh_rawtexts/
+storage/phase1/
+parsers/*.bak.*
+tests/parsers/cnh_fields/
