@@ -1,6 +1,3 @@
-from __future__ import annotations
-
-
 # --- WQ CNH postprocess helpers (v1) ---
 _WQ_CNH_FILIACAO_BAD_TOKENS = {
     "FILIATION", "FILIACIÓN", "OBSERVAÇÕES", "OBSERVATIONS", "OBSERVACIONES",
@@ -13,11 +10,9 @@ def _wq_is_glossary_noise_line(line: str) -> bool:
     if not t:
         return True
     up = t.upper()
-    # linha muito "título"/glossário multilingue
     hits = sum(1 for tok in _WQ_CNH_FILIACAO_BAD_TOKENS if tok in up)
     if hits >= 2:
         return True
-    # linhas com poucos chars úteis e muito ruído
     if len(up) < 6:
         return True
     return False
@@ -33,12 +28,10 @@ def _wq_cleanup_filiacao(filiacao):
             continue
         if _wq_is_glossary_noise_line(x):
             continue
-        # remove "lixos" curtos que aparecem como restos de OCR (ex: AAA OER, MAS FIO, ADA THE)
         toks = x.split()
         if len(toks) <= 2 and any(len(t) <= 3 for t in toks):
             continue
         out.append(x)
-    # dedupe preservando ordem
     seen = set()
     out2 = []
     for x in out:
@@ -51,7 +44,6 @@ def _wq_cleanup_filiacao(filiacao):
 
 
 def _wq_postprocess_out(out: dict) -> dict:
-    # não quebra se out não for dict esperado
     if not isinstance(out, dict):
         return out
     if "filiacao" in out:
@@ -62,6 +54,10 @@ def _wq_postprocess_out(out: dict) -> dict:
 import re
 from dataclasses import dataclass
 from typing import Any, Optional
+
+# >>> WQ ADD
+from parsers.cnh_fields.naturalidade import extract_naturalidade as _wq_extract_naturalidade
+# <<< WQ ADD
 
 
 # ----------------------------
@@ -84,12 +80,10 @@ def _wq_wrap_return_v1(*ret):
       - (dict, ...) ou [dict, ...]
     """
     try:
-        # chamada comum: _wq_wrap_return_v1(fields, dbg, parse_error)
         if len(ret) == 3 and isinstance(ret[0], dict):
             fields, dbg, parse_error = ret
             return (_wq_postprocess_out(fields), dbg, parse_error)
 
-        # chamada antiga: _wq_wrap_return_v1(dict)
         if len(ret) == 1:
             r0 = ret[0]
             if isinstance(r0, dict):
@@ -105,11 +99,9 @@ def _wq_wrap_return_v1(*ret):
                     return r0b
             return r0
 
-        # fallback: devolve como tuple
         if isinstance(ret, tuple) and ret and isinstance(ret[0], dict):
             return (_wq_postprocess_out(ret[0]), *ret[1:])
     except Exception:
-        # nunca quebra pipeline por pós-processamento
         pass
 
     return ret if len(ret) != 1 else ret[0]
@@ -140,15 +132,10 @@ def _upper(s: str) -> str:
 
 
 def _strip_leading_enum(s: str) -> str:
-    # Ex.: "8. MINISTÉRIO ..." -> "MINISTÉRIO ..."
     return re.sub(r"^\s*\d{1,2}\s*[\.)-]\s*", "", s or "").strip()
 
 
 def _alpha_ratio_letters_only(s: str) -> float:
-    """
-    Proporção de letras em relação ao total de caracteres "relevantes" (letras + dígitos).
-    Pontuação/símbolos não contam no denominador.
-    """
     if not s:
         return 0.0
     letters = sum(1 for ch in s if ch.isalpha())
@@ -156,7 +143,6 @@ def _alpha_ratio_letters_only(s: str) -> float:
     return letters / max(alnum, 1)
 
 
-# Bloqueio de headers institucionais e ruído frequente em CNH digital/exportada
 _INSTITUTIONAL_TOKENS = {
     "MINISTÉRIO",
     "MINISTERIO",
@@ -189,10 +175,7 @@ _INSTITUTIONAL_TOKENS = {
 }
 
 
-# Tokens típicos de *labels/campos* (PT/EN/ES) que NÃO podem virar nome.
-# Cobre o problema relatado: capturar headers multilíngues como se fossem nomes.
 _FIELD_LABEL_NOISE_TOKENS = {
-    # PT
     "LOCAL",
     "NASCIMENTO",
     "NATURALIDADE",
@@ -220,7 +203,6 @@ _FIELD_LABEL_NOISE_TOKENS = {
     "CATEGORIA",
     "CAT",
     "HAB",
-    # EN/ES
     "DATE",
     "PLACE",
     "BIRTH",
@@ -255,9 +237,6 @@ def _contains_institutional_noise(s: str) -> bool:
 
 
 def _strip_noise_lines(lines: list[str]) -> list[str]:
-    """
-    Remove linhas vazias/curtas. Mantém caixa alta para estabilidade.
-    """
     out: list[str] = []
     for ln in lines:
         u = _upper(ln)
@@ -322,33 +301,21 @@ _ALLOWED_CATEGORIAS = {"A", "B", "C", "D", "E", "AB", "AC", "AD", "AE"}
 
 
 def _normalize_categoria_token(tok: str) -> str:
-    # tolera "A B", "A-B", "A. B" etc
     t = _upper(tok)
     t = re.sub(r"[^A-Z]", "", t)
     return t
 
 
 def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, Any]] = None) -> Optional[str]:
-    """
-    Estratégia:
-      PASSO 0 (alto-confiável): procurar padrão "CPF + REGISTRO(11d) + CATEGORIA" na mesma linha
-      ou em 2 linhas concatenadas (linha i + i+1). Isso evita pegar letra 'E/A' perdida no lugar errado.
-
-      Depois, cai no método do anchor "CAT HAB" (com lookahead) e por fim no fallback "CATEGORIA:".
-    """
     if _dbg is not None:
         _dbg.setdefault("categoria_debug", {})
         _dbg["categoria_debug"].setdefault("hits", [])
         _dbg["categoria_debug"].setdefault("fallback_hits", [])
         _dbg["categoria_debug"].setdefault("chosen", None)
 
-    # ----------------------------
-    # PASSO 0: CPF + REGISTRO + CATEGORIA
-    # ----------------------------
     cpf_pat = r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"
     reg_pat = r"\b\d{11}\b"
 
-    # Procurar 2 letras primeiro (AB/AC/AD/AE), depois 1 letra.
     pat_2 = re.compile(rf"({cpf_pat}).*?({reg_pat}).*?\b(AB|AC|AD|AE)\b")
     pat_1 = re.compile(rf"({cpf_pat}).*?({reg_pat}).*?\b(A|B|C|D|E)\b")
 
@@ -374,7 +341,6 @@ def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, 
         if m1:
             cand = m1.group(3)
             if cand in _ALLOWED_CATEGORIAS:
-                # NÃO aceitar "A" se houver qualquer 2-letras no combo (mesmo distante)
                 if cand == "A" and re.search(r"\b(AB|AC|AD|AE)\b", combo):
                     continue
 
@@ -387,9 +353,6 @@ def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, 
                     }
                 return cand
 
-    # ----------------------------
-    # PASSO 1+: Anchor CAT HAB (com lookahead)
-    # ----------------------------
     def _is_placeholder_tail(t: str) -> bool:
         if not t:
             return False
@@ -420,7 +383,6 @@ def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, 
         if _dbg is not None:
             _dbg["categoria_debug"]["hits"].append({"line": u, "tail80": tail80, "tail25": tail25})
 
-        # 1) Preferir 2 letras na própria linha
         for m in re.finditer(r"\b(AB|AC|AD|AE)\b", tail80):
             cand = m.group(1)
             if cand in _ALLOWED_CATEGORIAS:
@@ -463,7 +425,6 @@ def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, 
                         }
                     return cand
 
-        # 3) Só então aceitar 1 letra na própria linha
         for m in re.finditer(r"\b(A|B|C|D|E)\b", tail25):
             cand = m.group(1)
             if cand in _ALLOWED_CATEGORIAS:
@@ -471,9 +432,6 @@ def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, 
                     _dbg["categoria_debug"]["chosen"] = {"value": cand, "mode": "cat_hab_1letter_same_line", "line": u}
                 return cand
 
-    # ----------------------------
-    # PASSO 2: fallback label direto
-    # ----------------------------
     for i, ln in enumerate(lines[:260]):
         u = _upper(ln)
         if "CATEG" not in u and "CAT" not in u:
@@ -516,10 +474,6 @@ def _extract_categoria_from_lines(lines: list[str], *, _dbg: Optional[dict[str, 
 
 
 def _clean_person_name_line(s: str) -> str:
-    """
-    Limpa ruído inicial e mantém apenas letras e espaços.
-    Remove tokens curtos típicos de ruído OCR (exceto partículas).
-    """
     u = _upper(_strip_leading_enum(s))
     if not u:
         return ""
@@ -548,7 +502,6 @@ def _is_plausible_fullname(s: str) -> bool:
     if _contains_institutional_noise(s0):
         return False
 
-    # Evita capturar labels multilíngues ("LOCAL DE NASCIMENTO / DATE AND PLACE", etc.) como nome.
     if _contains_field_label_noise(s0):
         return False
 
@@ -581,7 +534,6 @@ def _name_candidate_score(line: str) -> int:
     score += min(len(toks), 7) * 10
     score += int(_alpha_ratio_letters_only(s) * 40)
 
-    # bônus por partículas típicas
     for p in ("DA", "DE", "DO", "DOS", "DAS"):
         if p in toks:
             score += 4
@@ -591,12 +543,6 @@ def _name_candidate_score(line: str) -> int:
 
 
 def _extract_mrz_name(lines: list[str]) -> Optional[str]:
-    """
-    Fallback crítico: muitos PDFs exportados trazem o nome mais "limpo"
-    na linha MRZ (ex.: "BRUNO<<LIMA<CARNEIRO<<<<<<<<<<").
-    """
-    # Procura do fim para o começo (em PDFs exportados, MRZ costuma estar no rodapé).
-    # Regra determinística: precisa ter o padrão SOBRENOME<<NOME(s).
     for ln in reversed(lines[-220:]):
         if "<<" not in ln:
             continue
@@ -605,11 +551,9 @@ def _extract_mrz_name(lines: list[str]) -> Optional[str]:
         if not re.search(r"[A-Z]{2,}<<[A-Z]", u):
             continue
 
-        # Alguns OCRs duplicam a MRZ ou trazem lixo no começo; pega apenas o maior bloco com '<<'.
         blocks = [b for b in re.split(r"\s+", u) if "<<" in b]
         candidate_block = max(blocks, key=len) if blocks else u
 
-        # Normaliza: SOBRENOME<<NOMES<... -> "SOBRENOME NOMES"
         if "<<" in candidate_block:
             left, right = candidate_block.split("<<", 1)
             right = right.replace("<", " ")
@@ -625,26 +569,16 @@ def _extract_mrz_name(lines: list[str]) -> Optional[str]:
 
 
 def _extract_nome(lines: list[str]) -> Optional[str]:
-    """
-    Estratégia (determinística e auditável):
-    0) MRZ (<<) quando presente e plausível. (Maior confiabilidade nos PDFs exportados.)
-    1) Campo imediatamente após label de nome ("NOME", "NOME E SOBRENOME", "NOME CIVIL", "NAME").
-    2) Fallback: melhor candidato por score (após filtros anti-label/institucional).
-    """
-    # 0) MRZ primeiro
     mrz = _extract_mrz_name(lines)
     if mrz:
         return mrz
 
     candidates: list[str] = []
 
-    # 1) Label de nome -> linha seguinte / inline
-    # Nota: percorre um pouco mais para cobrir variações (alguns PDFs repetem blocos).
     name_label_re = re.compile(
         r"\b(NOME\s+E\s+SOBRENOME|NOME\s+CIVIL|NOME|NAME)\b\s*[:\-]?\s*(.*)$"
     )
 
-    # tokens que, se aparecerem na MESMA linha do label, indicam header multi-campo (rejeitar)
     label_line_reject = {
         "LOCAL",
         "NASCIMENTO",
@@ -664,7 +598,6 @@ def _extract_nome(lines: list[str]) -> Optional[str]:
         if "NOME" not in u and "NAME" not in u:
             continue
 
-        # Se a linha parece um header cheio de outros campos, rejeita.
         if any(tok in u for tok in label_line_reject) and not u.strip().startswith("NOME") and not u.strip().startswith("NAME"):
             continue
 
@@ -677,12 +610,10 @@ def _extract_nome(lines: list[str]) -> Optional[str]:
         if cand_inline and _is_plausible_fullname(cand_inline):
             candidates.append(cand_inline)
 
-        # Próximas linhas (primeira que não é outro label)
         for j in (1, 2, 3):
             nxt = _upper(_safe_get(lines, i + j))
             if not nxt:
                 continue
-            # Evita cair em "NOME CIVIL"/"CPF" etc.
             if name_label_re.search(nxt) and ("NOME" in nxt or "NAME" in nxt):
                 continue
             if _contains_institutional_noise(nxt) or _contains_field_label_noise(nxt):
@@ -696,10 +627,8 @@ def _extract_nome(lines: list[str]) -> Optional[str]:
         candidates.sort(key=_name_candidate_score, reverse=True)
         return candidates[0]
 
-    # 2) Fallback por score (com filtros já embutidos em _is_plausible_fullname)
     scored: list[tuple[int, str]] = []
     for ln in lines[:140]:
-        # Rejeita linhas muito longas: geralmente são frases institucionais ou blocos concatenados.
         if len(_upper(ln)) > 90:
             continue
         cand = _clean_person_name_line(ln)
@@ -868,22 +797,8 @@ def _extract_nascimento_validade(text: str, dates: list[str]) -> tuple[Optional[
 
 
 def _extract_naturalidade(lines: list[str]) -> tuple[Optional[str], Optional[str]]:
-    """Best-effort extraction of (cidade, UF) for naturalidade.
-
-    CNH exportada do app costuma trazer a naturalidade no bloco:
-    "DATA, LOCAL E UF DE NASCIMENTO" e o valor no formato:
-        DD/MM/AAAA, CIDADE, UF
-
-    Alguns OCRs também trazem "NATURALIDADE".
-
-    Regras:
-    - Nunca inventa: só retorna se encontrar UF válida (whitelist) e cidade plausível.
-    - Determinístico: baseado em âncoras e regex, sem heurísticas probabilísticas.
-    """
-
     def _extract_from_text(txt: str) -> tuple[Optional[str], Optional[str]]:
         u = _upper(txt)
-        # Padrão principal: data, cidade, UF (com vírgulas)
         m = re.search(
             r"\b(\d{2}[/-]\d{2}[/-]\d{4})\s*,\s*([A-ZÀ-Ú][A-ZÀ-Ú\s'\-\.]{2,}?)\s*,\s*([A-Z]{2})\b",
             u,
@@ -903,14 +818,12 @@ def _extract_naturalidade(lines: list[str]) -> tuple[Optional[str], Optional[str
     for i, ln in enumerate(lines):
         u = _upper(ln)
 
-        # 1) Âncora forte do bloco de naturalidade (OCR pode distorcer, então é por contains)
         if ("LOCAL" in u and "UF" in u and "NASC" in u):
             chunk = "\n".join([ln, _safe_get(lines, i + 1), _safe_get(lines, i + 2)])
             cidade, uf = _extract_from_text(chunk)
             if cidade and uf:
                 return cidade, uf
 
-        # 2) Fallback: NATURALIDADE / NATURAL
         if "NATURAL" in u:
             tail = re.split(r"NATURAL(?:IDADE)?\s*[:\-]?\s*", u, maxsplit=1)
             cand = tail[1] if len(tail) == 2 else ""
@@ -919,8 +832,6 @@ def _extract_naturalidade(lines: list[str]) -> tuple[Optional[str], Optional[str
             if cidade and uf:
                 return cidade, uf
 
-            # >>> WQ ADD
-            # padrão sem vírgula e sem data: "CIDADE UF"
             cand_u = _upper(cand)
             m_inline = re.search(r"\b([A-ZÀ-Ú][A-ZÀ-Ú\s'\-\.]{2,}?)\s+([A-Z]{2})\b", cand_u)
             if m_inline:
@@ -928,16 +839,14 @@ def _extract_naturalidade(lines: list[str]) -> tuple[Optional[str], Optional[str
                 uf2 = re.sub(r"[^A-Z]", "", m_inline.group(2))
                 if uf2 in _UF_SET and cidade2 and _alpha_ratio_letters_only(cidade2) >= 0.6:
                     return cidade2, uf2
-            # <<< WQ ADD
 
-            # ainda assim: alguns OCRs trazem "CIDADE, UF" sem data
             u2 = _upper(_safe_get(lines, i + 1))
             m2 = re.search(r"\b([A-ZÀ-Ú][A-ZÀ-Ú\s'\-\.]{2,}?)\s*,\s*([A-Z]{2})\b", u2)
             if m2:
-                cidade = _norm_spaces(m2.group(1)).strip(" \t\"'|.,;-_")
-                uf = re.sub(r"[^A-Z]", "", m2.group(2))
-                if uf in _UF_SET and cidade and _alpha_ratio_letters_only(cidade) >= 0.6:
-                    return cidade, uf
+                cidade3 = _norm_spaces(m2.group(1)).strip(" \t\"'|.,;-_")
+                uf3 = re.sub(r"[^A-Z]", "", m2.group(2))
+                if uf3 in _UF_SET and cidade3 and _alpha_ratio_letters_only(cidade3) >= 0.6:
+                    return cidade3, uf3
 
     return None, None
 
@@ -952,6 +861,7 @@ def analyze_cnh(
     lines = _strip_noise_lines(text.splitlines())
 
     dbg: dict[str, Any] = {"filename": filename}
+    dbg["mode"] = "senatran"
 
     cpf = _pick_best_cpf(text)
     dates = _find_all_dates(text)
@@ -961,7 +871,9 @@ def analyze_cnh(
     categoria = _extract_categoria_from_lines(lines, _dbg=dbg)
     filiacao = _extract_filiacao(lines, nome)
 
-    cidade, uf = _extract_naturalidade(lines)
+    # >>> WQ ADD
+    cidade, uf = _wq_extract_naturalidade(lines)
+    # <<< WQ ADD
 
     fields: dict[str, Any] = {
         "nome": nome,
@@ -974,31 +886,23 @@ def analyze_cnh(
         "filiacao": filiacao,
     }
 
-    # ----------------------------
-    # Hard checks (não bloqueia; reporta parse_error)
-    # ----------------------------
     missing: list[str] = []
     invalid: list[str] = []
 
-    # Nome
     if not (nome and isinstance(nome, str) and _is_plausible_fullname(nome)):
         missing.append("nome")
 
-    # CPF
     if not (cpf and isinstance(cpf, str) and len(cpf) == 11 and cpf.isdigit()):
         missing.append("cpf")
 
-    # Datas
     if not (data_nasc and re.match(r"^\d{2}/\d{2}/\d{4}$", data_nasc)):
         missing.append("data_nascimento")
     if not (validade and re.match(r"^\d{2}/\d{2}/\d{4}$", validade)):
         missing.append("validade")
 
-    # Categoria
     if not (categoria and categoria in _ALLOWED_CATEGORIAS):
         missing.append("categoria")
 
-    # Filiação (best-effort; mas audita)
     if filiacao is None:
         invalid.append("filiacao:null")
     else:
