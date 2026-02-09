@@ -5,15 +5,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 def extract_nome(raw_text: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Extrai o NOME do condutor de forma determinística.
-
-    Ordem:
-      1) MRZ (linhas com '<<') — forte e normalmente presente em CNH exportada
-      2) Campo visual (ancorado em rótulo NOME/NAME) — fallback
-
-    Retorna (nome, dbg).
-    """
     dbg: Dict[str, Any] = {
         "field": "nome",
         "method": None,
@@ -51,7 +42,6 @@ _MRZ_LINE_RE = re.compile(r"^[A-Z0-9<]{10,}$")
 _ONLY_LETTERS_SPACES_RE = re.compile(r"[^A-ZÀ-Ü ]+")
 _MULTI_SPACE_RE = re.compile(r"\s{2,}")
 
-# NOTE: removi "UF" daqui (não faz sentido como substring; quebrava FANDARUFF)
 _EXCLUDE_SUBSTRINGS = (
     "REPUBLICA",
     "FEDERATIVA",
@@ -82,7 +72,6 @@ _EXCLUDE_SUBSTRINGS = (
     "NATURALIDADE",
 )
 
-# tokens curtos: só bloquear se for palavra inteira
 _EXCLUDE_SHORT_WORDS = ("CPF", "RG", "DOC", "CNH", "UF")
 
 _LABEL_RE = re.compile(
@@ -129,6 +118,7 @@ def _extract_nome_from_label(text: str) -> Tuple[Optional[str], Dict[str, Any]]:
 
 def _extract_nome_from_mrz(text: str) -> Tuple[Optional[str], Dict[str, Any]]:
     lines = _lines(text)
+
     dbg: Dict[str, Any] = {
         "mrz_lines": [],
         "picked": None,
@@ -136,6 +126,7 @@ def _extract_nome_from_mrz(text: str) -> Tuple[Optional[str], Dict[str, Any]]:
         "candidates": {},
         "decision": None,
         "reason": None,
+        "considered": [],
     }
 
     mrz_candidates: List[str] = []
@@ -146,53 +137,125 @@ def _extract_nome_from_mrz(text: str) -> Tuple[Optional[str], Dict[str, Any]]:
         if _MRZ_LINE_RE.match(s):
             mrz_candidates.append(s)
 
-    dbg["mrz_lines"] = mrz_candidates[:10]
+    dbg["mrz_lines"] = mrz_candidates[:20]
     if not mrz_candidates:
         dbg["reason"] = "no_mrz_candidates"
         return None, dbg
 
-    # Escolhe a linha com maior densidade de letras (linha do nome tende a ganhar)
-    mrz_line = max(mrz_candidates, key=_mrz_score_line)
-    dbg["picked"] = mrz_line
+    context_has_doc_header = any(s.startswith("I<BRA") or s.startswith("P<BRA") for s in mrz_candidates)
 
-    parsed, parsed_dbg = _parse_mrz_name(mrz_line, full_text=text)
-    dbg["parsed"] = parsed
-    dbg["candidates"] = parsed_dbg.get("candidates", {})
-    dbg["decision"] = parsed_dbg.get("decision")
+    # Texto NÃO-MRZ para scoring (linhas sem '<'): aproxima do “visual”
+    non_mrz_text = " ".join(ln.upper() for ln in lines if "<" not in (ln or "")).strip()
 
-    if not parsed:
-        dbg["reason"] = parsed_dbg.get("reason") or "parse_failed"
+    # Considera apenas linhas que parecem “linha de nome”:
+    # - tem '<<'
+    # - não começa com I<... ou P<... (header)
+    # - não é a linha “numérica” (muitos dígitos)
+    name_lines = []
+    for s in mrz_candidates:
+        if s.startswith("I<") or s.startswith("P<"):
+            continue
+        digits = sum(1 for ch in s if ch.isdigit())
+        if digits >= 8:
+            continue
+        name_lines.append(s)
+
+    if not name_lines:
+        dbg["reason"] = "no_name_like_mrz_lines"
         return None, dbg
 
-    candidate = _clean_name_candidate(parsed)
-    if _is_valid_name_candidate(candidate):
-        return candidate, dbg
+    best: Optional[Dict[str, Any]] = None
 
-    dbg["reason"] = "invalid_after_clean"
-    return None, dbg
+    for s in name_lines:
+        picked_is_doc_header = s.startswith("I<") or s.startswith("P<")
+
+        parsed, parsed_dbg = _parse_mrz_name(
+            s,
+            full_text=text,
+            context_has_doc_header=context_has_doc_header,
+            picked_is_doc_header=picked_is_doc_header,
+        )
+
+        if not parsed:
+            dbg["considered"].append(
+                {
+                    "line": s,
+                    "ok": False,
+                    "decision": parsed_dbg.get("decision"),
+                    "reason": parsed_dbg.get("reason"),
+                }
+            )
+            continue
+
+        cleaned = _clean_name_candidate(parsed)
+        if not _is_valid_name_candidate(cleaned):
+            dbg["considered"].append(
+                {
+                    "line": s,
+                    "ok": False,
+                    "decision": parsed_dbg.get("decision"),
+                    "reason": "invalid_after_clean",
+                    "parsed": parsed,
+                }
+            )
+            continue
+
+        chosen_side = "A" if str(parsed_dbg.get("decision", "")).startswith("A") else "B"
+        tokens = []
+        cand = parsed_dbg.get("candidates", {}).get(chosen_side, {})
+        if isinstance(cand, dict):
+            tokens = cand.get("tokens") or []
+        if not isinstance(tokens, list):
+            tokens = []
+
+        score = _token_hit_score(non_mrz_text, tokens)
+
+        item = {
+            "line": s,
+            "ok": True,
+            "parsed": cleaned,
+            "decision": parsed_dbg.get("decision"),
+            "score": score,
+            "tokens": tokens,
+        }
+        dbg["considered"].append(item)
+
+        if best is None:
+            best = item
+        else:
+            # maior score ganha
+            if item["score"] > best["score"]:
+                best = item
+            elif item["score"] == best["score"]:
+                # tie determinístico: preferir a linha que aparece primeiro no MRZ block
+                # (estável e auditável, e tende a escolher a primeira ocorrência “boa”)
+                best = best
+
+    if not best:
+        dbg["reason"] = "no_valid_parsed_candidate"
+        return None, dbg
+
+    dbg["picked"] = best["line"]
+    dbg["parsed"] = best["parsed"]
+    dbg["decision"] = best["decision"]
+    dbg["candidates"] = {"selected": {"tokens": best.get("tokens"), "score": best.get("score")}}
+
+    return best["parsed"], dbg
 
 
-def _mrz_score_line(s: str) -> Tuple[int, int, int]:
-    up = s.upper()
-    letters = sum(1 for ch in up if "A" <= ch <= "Z")
-    seps = up.count("<")
-    digits = sum(1 for ch in up if "0" <= ch <= "9")
-    return (letters, seps, -digits)
+def _token_hit_score(non_mrz_text: str, tokens: List[str]) -> int:
+    if not non_mrz_text or not tokens:
+        return 0
+    return sum(1 for t in tokens if isinstance(t, str) and t and t in non_mrz_text)
 
 
-def _parse_mrz_name(mrz_line: str, *, full_text: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Tenta duas interpretações:
-
-    A) passaporte: SOBRENOME<<NOMES<...   -> retorna "PRIMEIRO_NOME SOBRENOME"
-    B) CNH fixtures: NOME<<SOBRENOME<SOBRENOME2<... -> retorna "NOME SOBRENOME SOBRENOME2"
-
-    Decisão determinística:
-      - Gera candidato A e B
-      - Valida ambos
-      - Pontua por presença dos tokens em linhas NÃO-MRZ (sem '<')
-      - Maior score ganha; empate -> A (para satisfazer unit tests sem texto extra)
-    """
+def _parse_mrz_name(
+    mrz_line: str,
+    *,
+    full_text: str,
+    context_has_doc_header: bool,
+    picked_is_doc_header: bool,
+) -> Tuple[Optional[str], Dict[str, Any]]:
     dbg: Dict[str, Any] = {"candidates": {}, "decision": None, "reason": None}
 
     s = mrz_line.upper()
@@ -208,7 +271,6 @@ def _parse_mrz_name(mrz_line: str, *, full_text: str) -> Tuple[Optional[str], Di
     left_raw = parts[0]
     right_raw = parts[1]
 
-    # remove prefixo antes do último '<' do lado esquerdo (ex.: "I<BRA...<<")
     if "<" in left_raw:
         left_raw = left_raw.split("<")[-1]
 
@@ -219,35 +281,29 @@ def _parse_mrz_name(mrz_line: str, *, full_text: str) -> Tuple[Optional[str], Di
         dbg["reason"] = "no_tokens"
         return None, dbg
 
-    # candidato A: PRIMEIRO_NOME (do right) + SOBRENOME(s) (do left)
     cand_a_tokens = [right_tokens[0]] + left_tokens
     cand_a = " ".join(cand_a_tokens).strip()
 
-    # candidato B: NOME(s) (left) + SOBRENOME(s) (right)
     cand_b_tokens = left_tokens + right_tokens
     cand_b = " ".join(cand_b_tokens).strip()
 
     dbg["candidates"]["A"] = {"value": cand_a, "tokens": cand_a_tokens}
     dbg["candidates"]["B"] = {"value": cand_b, "tokens": cand_b_tokens}
 
-    # texto não-MRZ para scoring (linhas sem '<')
-    non_mrz_text = " ".join(
-        ln.upper() for ln in _lines(full_text) if "<" not in (ln or "")
-    )
+    non_mrz_lines = [ln.upper() for ln in _lines(full_text) if "<" not in (ln or "")]
+    non_mrz_text = " ".join(non_mrz_lines)
 
     def score(tokens: List[str]) -> int:
         if not non_mrz_text.strip():
             return 0
         return sum(1 for t in tokens if t and t in non_mrz_text)
 
-    # validação básica antes de escolher
     a_ok = _is_valid_name_candidate(_clean_name_candidate(cand_a))
     b_ok = _is_valid_name_candidate(_clean_name_candidate(cand_b))
 
     dbg["candidates"]["A"]["valid"] = a_ok
     dbg["candidates"]["B"]["valid"] = b_ok
 
-    # se só um é válido, escolhe ele
     if a_ok and not b_ok:
         dbg["decision"] = "A_only_valid"
         return cand_a, dbg
@@ -259,7 +315,6 @@ def _parse_mrz_name(mrz_line: str, *, full_text: str) -> Tuple[Optional[str], Di
         dbg["reason"] = "both_invalid"
         return None, dbg
 
-    # ambos válidos: escolhe por score
     sa = score(cand_a_tokens)
     sb = score(cand_b_tokens)
     dbg["candidates"]["A"]["score"] = sa
@@ -272,7 +327,33 @@ def _parse_mrz_name(mrz_line: str, *, full_text: str) -> Tuple[Optional[str], Di
         dbg["decision"] = "A_by_score"
         return cand_a, dbg
 
-    # empate -> A (unit tests sem contexto extra)
+    if context_has_doc_header and not picked_is_doc_header:
+        if not non_mrz_text.strip() and len(left_tokens) == 1 and len(right_tokens) >= 2:
+            dbg["decision"] = "A_by_tie_passport_shape"
+            return cand_a, dbg
+
+        if len(right_tokens) > len(left_tokens) and non_mrz_text.strip():
+            dbg["decision"] = "B_by_tie_cnh_tokens"
+            return cand_b, dbg
+
+        if non_mrz_text.strip():
+            left_first = left_tokens[0]
+            right_first = right_tokens[0]
+            pos_left = non_mrz_text.find(left_first) if left_first else -1
+            pos_right = non_mrz_text.find(right_first) if right_first else -1
+            dbg["candidates"]["tie_positions"] = {"left": pos_left, "right": pos_right}
+
+            if pos_left != -1 and pos_right != -1:
+                if pos_left < pos_right:
+                    dbg["decision"] = "B_by_tie_cnh_order"
+                    return cand_b, dbg
+                if pos_right < pos_left:
+                    dbg["decision"] = "A_by_tie_cnh_order"
+                    return cand_a, dbg
+
+        dbg["decision"] = "A_by_tie"
+        return cand_a, dbg
+
     dbg["decision"] = "A_by_tie"
     return cand_a, dbg
 
@@ -330,12 +411,10 @@ def _is_valid_name_candidate(name: Optional[str]) -> bool:
 
     up = name.upper()
 
-    # bloqueios por palavra inteira (curtos)
     for w in _EXCLUDE_SHORT_WORDS:
         if _has_short_word(up, w):
             return False
 
-    # bloqueios por substring (longos)
     for bad in _EXCLUDE_SUBSTRINGS:
         if bad in up:
             return False

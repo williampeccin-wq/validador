@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
-from parsers.cnh_fields.naturalidade import extract_naturalidade
 from parsers.cnh_fields.nome import extract_nome
+from parsers.cnh_fields.naturalidade import extract_naturalidade as extract_naturalidade_lines
 
 SCHEMA_VERSION = "cnh.fields.v2"
 
@@ -20,26 +20,20 @@ def analyze_cnh(
     Contrato:
       - Retorna sempre 3 itens: (fields, dbg, parse_error)
       - Mantém chaves compatíveis no `fields` (mesmo que None enquanto módulos não existem)
-      - Extração determinística por módulo (sem heurística “mágica” aqui)
+      - Extração determinística por módulo
 
-    Campos implementados (v2):
-      - nome (parsers/cnh_fields/nome.py)
-      - naturalidade (parsers/cnh_fields/naturalidade.py)
-
-    Campos legados mantidos como placeholders:
-      - cpf, categoria, data_nascimento, validade, filiacao
+    Campos implementados:
+      - nome: parsers/cnh_fields/nome.py  -> (nome, dbg)
+      - naturalidade: parsers/cnh_fields/naturalidade.py (tag v0.4.3...) -> (cidade, uf) via lines[]
     """
     text = raw_text or ""
+    lines = text.splitlines()
 
     # --- v2 extractions ---
     nome, nome_dbg = extract_nome(text)
-    naturalidade, nat_dbg = extract_naturalidade(text)
 
-    cidade_nascimento = None
-    uf_nascimento = None
-    if isinstance(naturalidade, dict):
-        cidade_nascimento = naturalidade.get("cidade")
-        uf_nascimento = naturalidade.get("uf")
+    cidade, uf = extract_naturalidade_lines(lines)
+    naturalidade = {"cidade": cidade, "uf": uf} if (cidade and uf) else None
 
     # --- fields (compat-first) ---
     fields: Dict[str, Any] = {
@@ -47,9 +41,9 @@ def analyze_cnh(
         "nome": nome,
         "naturalidade": naturalidade,  # {"cidade": "...", "uf": "..."} ou None
 
-        # legacy-compatible flat keys (mantém consumidores antigos vivos)
-        "cidade_nascimento": cidade_nascimento,
-        "uf_nascimento": uf_nascimento,
+        # legacy-compatible flat keys
+        "cidade_nascimento": cidade if cidade else None,
+        "uf_nascimento": uf if uf else None,
 
         # placeholders (módulos futuros)
         "cpf": None,
@@ -65,7 +59,11 @@ def analyze_cnh(
         "filename": filename,
         "fields_v2": {
             "nome": nome_dbg,
-            "naturalidade": nat_dbg,
+            "naturalidade": {
+                "method": "legacy_lines_v0.4.3",
+                "cidade": cidade,
+                "uf": uf,
+            },
         },
         "pending_fields": [
             "cpf",
@@ -80,7 +78,7 @@ def analyze_cnh(
     missing: list[str] = []
     if not nome:
         missing.append("nome")
-    if not cidade_nascimento or not uf_nascimento:
+    if not (cidade and uf):
         missing.append("naturalidade")
 
     parse_error: Optional[Dict[str, Any]] = None
