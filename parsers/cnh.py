@@ -3,83 +3,63 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 from parsers.cnh_fields.nome import extract_nome
-from parsers.cnh_fields.naturalidade import extract_naturalidade as extract_naturalidade_lines
+from parsers.cnh_fields.naturalidade import extract_naturalidade
+from parsers.cnh_fields.categoria import extract_categoria
 
-SCHEMA_VERSION = "cnh.fields.v2"
+SCHEMA_VERSION = "cnh_fields_v2"
 
 
-def analyze_cnh(
-    raw_text: str,
-    *,
-    filename: Optional[str] = None,
-    **_kwargs: Any,
-) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+def analyze_cnh(raw_text: str, *, filename: str | None = None) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
     """
-    CNH Parser — Fields v2 Orchestrator (gradual refactor).
+    CNH parser (fields v2) — contrato:
+      (fields, dbg, parse_error)
 
-    Contrato:
-      - Retorna sempre 3 itens: (fields, dbg, parse_error)
-      - Mantém chaves compatíveis no `fields` (mesmo que None enquanto módulos não existem)
-      - Extração determinística por módulo
-
-    Campos implementados:
-      - nome: parsers/cnh_fields/nome.py  -> (nome, dbg)
-      - naturalidade: parsers/cnh_fields/naturalidade.py (tag v0.4.3...) -> (cidade, uf) via lines[]
+    - Não bloqueia: se faltar campo v2, retorna parse_error (non-blocking) e lista em dbg["pending_fields"].
+    - Determinístico e auditável: dbg["fields_v2"][campo] contém o debug de cada extrator.
     """
-    text = raw_text or ""
-    lines = text.splitlines()
-
-    # --- v2 extractions ---
-    nome, nome_dbg = extract_nome(text)
-
-    cidade, uf = extract_naturalidade_lines(lines)
-    naturalidade = {"cidade": cidade, "uf": uf} if (cidade and uf) else None
-
-    # --- fields (compat-first) ---
-    fields: Dict[str, Any] = {
-        # v2 canonical
-        "nome": nome,
-        "naturalidade": naturalidade,  # {"cidade": "...", "uf": "..."} ou None
-
-        # legacy-compatible flat keys
-        "cidade_nascimento": cidade if cidade else None,
-        "uf_nascimento": uf if uf else None,
-
-        # placeholders (módulos futuros)
-        "cpf": None,
-        "categoria": None,
-        "data_nascimento": None,
-        "validade": None,
-        "filiacao": None,
-    }
-
-    # --- dbg (auditável) ---
+    fields: Dict[str, Any] = {}
     dbg: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "filename": filename,
-        "fields_v2": {
-            "nome": nome_dbg,
-            "naturalidade": {
-                "method": "legacy_lines_v0.4.3",
-                "cidade": cidade,
-                "uf": uf,
-            },
-        },
-        "pending_fields": [
-            "cpf",
-            "categoria",
-            "data_nascimento",
-            "validade",
-            "filiacao",
-        ],
+        "fields_v2": {},
+        "pending_fields": [],
     }
 
-    # --- non-blocking parse_error: só sinaliza o que já decidimos implementar ---
     missing: list[str] = []
+
+    # --- NOME ---
+    nome, nome_dbg = extract_nome(raw_text or "")
+    fields["nome"] = nome
+    dbg["fields_v2"]["nome"] = nome_dbg
     if not nome:
         missing.append("nome")
-    if not (cidade and uf):
+
+        # --- NATURALIDADE ---
+    lines = (raw_text or "").splitlines()
+    cidade, uf = extract_naturalidade(lines)
+    nat = {"cidade": cidade, "uf": uf} if (cidade and uf) else None
+
+    nat_dbg = {"field": "naturalidade", "method": "legacy_lines_v0.4.3", "cidade": cidade, "uf": uf}
+    fields["naturalidade"] = nat
+    dbg["fields_v2"]["naturalidade"] = nat_dbg
+
+    if isinstance(nat, dict):
+        fields["cidade_nascimento"] = nat.get("cidade")
+        fields["uf_nascimento"] = nat.get("uf")
+    else:
+        fields["cidade_nascimento"] = None
+        fields["uf_nascimento"] = None
         missing.append("naturalidade")
+
+
+    # --- CATEGORIA ---
+    categoria, cat_dbg = extract_categoria(raw_text or "")
+    fields["categoria"] = categoria
+    dbg["fields_v2"]["categoria"] = cat_dbg
+    if not categoria:
+        missing.append("categoria")
+
+    dbg["pending_fields"] = missing[:]
 
     parse_error: Optional[Dict[str, Any]] = None
     if missing:
