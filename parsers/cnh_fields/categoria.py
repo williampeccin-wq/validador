@@ -1,283 +1,202 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional, Tuple
 
-_ALLOWED_1 = {"A", "B", "C", "D", "E"}
-_ALLOWED_2 = {"AB", "AC", "AD", "AE"}
-_ALLOWED = _ALLOWED_1 | _ALLOWED_2
+# Categorias CNH (inclui combinações mais comuns)
+_VALID_CATS = ("AB", "AC", "AD", "AE", "B", "C", "D", "E", "A")
+_RE_CAT = re.compile(r"\b(AB|AC|AD|AE|B|C|D|E|A)\b")
 
-_RE_CAT_2 = re.compile(r"\b(AB|AC|AD|AE)\b", re.IGNORECASE)
-_RE_CAT_1 = re.compile(r"\b([A-E])\b", re.IGNORECASE)
+_RE_11 = re.compile(r"\b\d{11}\b")
+_RE_CPF_FMT = re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b")
 
-_RE_CPF_DOTTED = re.compile(r"\b\d{3}\.\d{3}\.\d{3}-\d{2}\b")
-_RE_11DIG = re.compile(r"\b\d{11}\b")
-
-_RE_ANCHOR_CATHAB = re.compile(r"(?i)\bCAT(?:\.|\s*)HAB\b")
-_RE_ANCHOR_CATEGORIA = re.compile(r"(?i)\bCATEG(?:ORIA|ORY)\b")
-
-_AFTER_MAX_POS = 8
-_AFTER_LEN = 40
+# "CAT.HAB", "CAT HAB", "CATHAB" etc (robusto a ruído e pontuação)
+def _compact(u: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (u or "").upper())
 
 
-def extract_categoria(raw_text: str) -> Tuple[Optional[str], Dict[str, Any]]:
-    """
-    Estratégia (determinística, auditável):
-      1) CAT.HAB header + próxima linha "pura" (ex.: 'AE')
-         -> method: anchor_cat_hab_record_line (compat com testes)
-      2) CAT.HAB header + linha seguinte contendo CPF/registro + categoria
-         -> method: anchor_cat_hab_record_line (compat com testes)
-      3) linha de registro (CPF + 11 dígitos) e categoria colada no after (<=8 chars)
-         -> method: anchor_cat_hab_record_line (compat com testes)
-      4) fallback âncora CATEGORIA + próxima linha -> method: anchor_categoria
-      5) none
-    """
-    dbg: Dict[str, Any] = {
-        "field": "categoria",
-        "method": "none",
-        "hit": None,
-        "window": None,
-        "candidates": [],
-        "chosen": None,
-        "reason": None,
-        "after_max_pos": _AFTER_MAX_POS,
-    }
-
-    lines = _lines(_normalize_text(raw_text))
-    if not lines:
-        dbg["reason"] = "empty"
-        return None, dbg
-
-    # (1) CAT.HAB header + próxima linha pura (ou header+linha registro)
-    cat, info = _scan_cat_hab_anchor(lines)
-    if cat:
-        dbg.update(info)
-        dbg["method"] = "anchor_cat_hab_record_line"
-        dbg["chosen"] = cat
-        return cat, dbg
-
-    # (2) record_line (CPF + registro) com regra after<=8
-    cat, info = _scan_record_lines(lines)
-    if cat:
-        dbg.update(info)
-        dbg["method"] = "anchor_cat_hab_record_line"
-        dbg["chosen"] = cat
-        return cat, dbg
-
-    # (3) fallback "CATEGORIA"
-    cat, info = _scan_categoria_anchor(lines)
-    if cat:
-        dbg.update(info)
-        dbg["method"] = "anchor_categoria"
-        dbg["chosen"] = cat
-        return cat, dbg
-
-    dbg["reason"] = "not_found"
-    return None, dbg
-
-
-# -----------------------
-# internals
-# -----------------------
-
-def _normalize_text(raw_text: str) -> str:
-    t = (raw_text or "").replace("\x00", "")
-    t = t.replace("\r\n", "\n").replace("\r", "\n")
-    return t
-
-
-def _lines(text: str) -> list[str]:
-    return [ln.rstrip("\n") for ln in (text or "").split("\n")]
+def _norm_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
 
 def _upper(s: str) -> str:
-    return (s or "").upper()
+    return _norm_spaces(s).upper()
 
 
-def _only_digits_mask(u: str) -> str:
-    return re.sub(r"\D", " ", u)
+def _safe_get(lines: list[str], idx: int) -> str:
+    if 0 <= idx < len(lines):
+        return lines[idx]
+    return ""
 
 
-def _extract_after_registro(u: str, registro_end: int) -> str:
-    return u[registro_end : registro_end + _AFTER_LEN]
-
-
-def _pure_value(line: str) -> Optional[str]:
-    if not line:
-        return None
-    u = re.sub(r"[^A-Z]", " ", _upper(line))
-    toks = [t for t in u.split() if t]
-    if len(toks) != 1:
-        return None
-    tok = toks[0]
-    return tok if tok in _ALLOWED else None
-
-
-def _pick_from_after(after: str) -> Tuple[Optional[str], List[str], str, Optional[int]]:
-    if not after:
-        return None, [], "empty_after", None
-
-    found: List[Tuple[int, int, str]] = []
-    all_cands: List[str] = []
-
-    for m in _RE_CAT_2.finditer(after):
-        cand = m.group(1).upper()
-        pos = m.start(1)
-        all_cands.append(cand)
-        if pos <= _AFTER_MAX_POS:
-            found.append((pos, 0, cand))
-
-    toks = [(m.group(1).upper(), m.start(1)) for m in _RE_CAT_1.finditer(after)]
-    for i in range(len(toks) - 1):
-        c1, p1 = toks[i]
-        c2, p2 = toks[i + 1]
-        if p1 > _AFTER_MAX_POS:
-            continue
-        if p2 - p1 > 4:
-            continue
-        pair = c1 + c2
-        all_cands.append(pair)
-        if pair in _ALLOWED_2 and p1 <= _AFTER_MAX_POS:
-            found.append((p1, 0, pair))
-
-    for m in _RE_CAT_1.finditer(after):
-        cand = m.group(1).upper()
-        pos = m.start(1)
-        all_cands.append(cand)
-        if pos <= _AFTER_MAX_POS:
-            found.append((pos, 1, cand))
-
-    if not found:
-        return None, all_cands, "no_candidate_within_after_max_pos", None
-
-    found.sort(key=lambda x: (x[0], x[1], 0 if len(x[2]) == 2 else 1))
-    chosen = found[0][2]
-    chosen_pos = found[0][0]
-
-    if chosen not in _ALLOWED:
-        return None, all_cands, "invalid_chosen", chosen_pos
-
-    return chosen, all_cands, "picked_by_after_near_registro", chosen_pos
-
-
-def _scan_cat_hab_anchor(lines: list[str]) -> Tuple[Optional[str], Dict[str, Any]]:
+def _is_pure_cat_line(u: str) -> Optional[str]:
     """
-    Cobre:
-      - "9 CAT.HAB\nAE\n" (próxima linha pura)
-      - "4d ... CAT.HAB\n<linha do registro com CPF + 11 + categoria>"
+    Linha com valor "puro" da categoria (ex.: "AE", "AB", "B")
     """
-    info: Dict[str, Any] = {"hit": None, "window": None, "candidates": [], "reason": None}
+    u = _upper(u)
+    if not u:
+        return None
+    # remove wrappers comuns: parênteses, pipes etc.
+    u2 = re.sub(r"^[\s\(\[\{<\|]+", "", u)
+    u2 = re.sub(r"[\s\)\]\}>\|]+$", "", u2)
+    u2 = _upper(u2)
+    if u2 in _VALID_CATS:
+        return u2
+    return None
 
+
+def _pick_cat_by_earliest(after_u: str) -> Tuple[Optional[str], dict]:
+    """
+    Escolhe a categoria pela PRIMEIRA ocorrência (menor índice) no trecho "after".
+    Isso evita regressão tipo: "B | Cm E E LT" virar "E".
+    """
+    after_u = after_u or ""
+    hits = []
+    for m in _RE_CAT.finditer(after_u):
+        cat = m.group(1)
+        if cat in _VALID_CATS:
+            hits.append((m.start(), cat))
+
+    dbg: dict[str, Any] = {"after": after_u, "candidates": [c for _, c in hits]}
+
+    if not hits:
+        dbg["chosen"] = None
+        return None, dbg
+
+    hits.sort(key=lambda t: t[0])  # menor posição primeiro
+    chosen = hits[0][1]
+    dbg["chosen"] = chosen
+    dbg["chosen_pos"] = hits[0][0]
+    return chosen, dbg
+
+
+def extract_categoria(raw_text: str) -> Tuple[Optional[str], dict]:
+    """
+    Retorna (categoria, dbg).
+
+    Estratégia:
+      1) Âncora CAT.HAB (várias formas) -> tenta linha seguinte "pura" (AE etc)
+      2) Caso contrário, busca linha do REGISTRO (11 dígitos) próxima da âncora e pega categoria
+         no trecho após o registro (earliest match).
+      3) Fallback: rótulo "CATEGORIA" em linhas próximas.
+    """
+    lines = (raw_text or "").splitlines()
+    dbg: dict[str, Any] = {"field": "categoria", "method": "none"}
+
+    # 1) CAT.HAB anchors
+    anchor_idxs: list[int] = []
     for i, ln in enumerate(lines):
-        if not _RE_ANCHOR_CATHAB.search(ln or ""):
-            continue
+        cu = _compact(ln)
+        if "CAT" in cu and "HAB" in cu:
+            anchor_idxs.append(i)
 
-        nxt = lines[i + 1] if i + 1 < len(lines) else ""
-        info["hit"] = {"anchor": "cat_hab", "line_index": i, "line": ln}
-        info["window"] = [ln, nxt]
-
-        # 1) próxima linha pura
-        pure = _pure_value(nxt)
+    for i in anchor_idxs:
+        hit = {"anchor": "cat_hab", "line_index": i, "line": lines[i]}
+        window = [lines[i], _safe_get(lines, i + 1), _safe_get(lines, i + 2), _safe_get(lines, i + 3)]
+        # 1a) next line pure value (ex.: "AE")
+        pure = _is_pure_cat_line(window[1])
         if pure:
-            info["candidates"] = [pure]
-            info["reason"] = "pure_next_line"
-            return pure, info
+            dbg2 = {
+                "field": "categoria",
+                "method": "anchor_cat_hab_next_line",
+                "hit": hit,
+                "window": window[:2],
+                "candidates": [pure],
+                "chosen": pure,
+                "after_max_pos": 8,
+            }
+            return pure, dbg2
 
-        # 2) próxima linha é record_line (CPF + 11digits) -> extrai do AFTER do registro
-        u = _upper(nxt)
-        if _RE_CPF_DOTTED.search(u):
-            mask = _only_digits_mask(u)
-            blocks = list(_RE_11DIG.finditer(mask))
-            if blocks:
-                reg = blocks[-1]
-                after = _extract_after_registro(u, reg.end())
-                cat, cands, reason, pos = _pick_from_after(after)
-                if cat:
-                    info["candidates"] = cands
-                    info["reason"] = "cat_hab_header_then_record_line"
-                    info["after"] = after
-                    info["after_pos"] = pos
-                    return cat, info
+        # 1b) record line search near anchor
+        # procura uma linha "de registro": tem cpf formatado OU pelo menos 11 dígitos; pegamos o ÚLTIMO bloco de 11
+        best_line_idx: Optional[int] = None
+        best_after: Optional[str] = None
+        best_pick_dbg: Optional[dict] = None
+        best_cat: Optional[str] = None
 
-        info["reason"] = "anchor_found_but_no_candidate"
-        return None, info
+        for k in (i, i + 1, i + 2, i + 3):
+            if not (0 <= k < len(lines)):
+                continue
+            u = _upper(lines[k])
+            # precisa ter 11 dígitos (registro) em algum lugar
+            mask = re.sub(r"\D", " ", u)
+            blocks = list(_RE_11.finditer(mask))
+            if not blocks:
+                continue
 
-    info["reason"] = "anchor_not_found"
-    return None, info
+            reg = blocks[-1]  # registro tende a ser o último 11-dígitos na linha
+            # substr após o fim do "registro" (mesmo índice do mask, mas serve bem no u porque tamanhos iguais ao u? não)
+            # Para não depender de alinhamento mask/u, usamos o índice do match dentro do mask apenas para estimar
+            # e usamos uma heurística: pega um "tail" do u e escolhe earliest categoria nele.
+            # Melhor: achar o próprio 11-dígitos no u e usar o último occurrence real.
+            reg_digits = mask[reg.start() : reg.end()].replace(" ", "")
+            if not reg_digits or len(reg_digits) != 11:
+                continue
 
+            # encontra a última ocorrência desses dígitos no u
+            pos = u.rfind(reg_digits)
+            if pos < 0:
+                continue
+            after_u = u[pos + len(reg_digits) : pos + len(reg_digits) + 40]
+            cat, pick_dbg = _pick_cat_by_earliest(after_u)
 
-def _scan_record_lines(lines: list[str]) -> Tuple[Optional[str], Dict[str, Any]]:
-    best: Optional[Tuple[int, int, str, Dict[str, Any]]] = None
+            # se não achou categoria aqui, segue
+            if not cat:
+                continue
 
+            # guarda o primeiro candidato bom; como _pick_cat_by_earliest já garante ordem,
+            # preferimos a linha mais próxima do anchor e com categoria mais cedo no after.
+            if best_cat is None:
+                best_line_idx = k
+                best_after = after_u
+                best_pick_dbg = pick_dbg
+                best_cat = cat
+            else:
+                # desempate: menor distância ao anchor, depois menor chosen_pos no after
+                assert best_line_idx is not None and best_pick_dbg is not None
+                dist_new = abs(k - i)
+                dist_old = abs(best_line_idx - i)
+                pos_new = int(pick_dbg.get("chosen_pos") or 10**9)
+                pos_old = int(best_pick_dbg.get("chosen_pos") or 10**9)
+                if (dist_new, pos_new) < (dist_old, pos_old):
+                    best_line_idx = k
+                    best_after = after_u
+                    best_pick_dbg = pick_dbg
+                    best_cat = cat
+
+        if best_cat:
+            dbg2 = {
+                "field": "categoria",
+                "method": "anchor_cat_hab_record_line",
+                "hit": hit,
+                "window": window[:3],
+                "after": best_after,
+                "candidates": (best_pick_dbg or {}).get("candidates") if isinstance(best_pick_dbg, dict) else [],
+                "chosen": best_cat,
+                "reason": "record_line_after_reg_earliest",
+                "after_max_pos": 8,
+            }
+            # extra para debug (não quebra contrato)
+            if isinstance(best_pick_dbg, dict):
+                dbg2["pick_dbg"] = best_pick_dbg
+                dbg2["record_line_index"] = best_line_idx
+            return best_cat, dbg2
+
+    # 2) Fallback: "CATEGORIA" label (simples)
     for i, ln in enumerate(lines):
         u = _upper(ln)
-        if not _RE_CPF_DOTTED.search(u):
-            continue
+        if "CATEGORIA" in u:
+            # tenta próxima linha como valor
+            cand = _is_pure_cat_line(_safe_get(lines, i + 1))
+            if cand:
+                dbg2 = {
+                    "field": "categoria",
+                    "method": "anchor_categoria",
+                    "hit": {"anchor": "categoria", "line_index": i, "line": ln},
+                    "window": [ln, _safe_get(lines, i + 1)],
+                    "candidates": [cand],
+                    "chosen": cand,
+                }
+                return cand, dbg2
 
-        mask = _only_digits_mask(u)
-        blocks = list(_RE_11DIG.finditer(mask))
-        if not blocks:
-            continue
-
-        reg = blocks[-1]
-        after = _extract_after_registro(u, reg.end())
-
-        cat, cands, reason, pos = _pick_from_after(after)
-        if not cat:
-            continue
-
-        prefer = 0 if len(cat) == 2 else 1
-        info: Dict[str, Any] = {
-            "hit": {"anchor": "record_line", "line_index": i, "line": ln},
-            "window": [ln],
-            "candidates": cands,
-            "reason": reason,
-            "after": after,
-            "after_pos": pos,
-        }
-
-        if best is None or (pos, prefer) < (best[0], best[1]):
-            best = (pos if pos is not None else 9999, prefer, cat, info)
-
-    if best:
-        return best[2], best[3]
-
-    return None, {"reason": "no_record_lines_matched"}
-
-
-def _scan_categoria_anchor(lines: list[str]) -> Tuple[Optional[str], Dict[str, Any]]:
-    info: Dict[str, Any] = {"hit": None, "window": None, "candidates": [], "reason": None}
-
-    for i, ln in enumerate(lines):
-        if not _RE_ANCHOR_CATEGORIA.search(ln or ""):
-            continue
-
-        nxt = lines[i + 1] if i + 1 < len(lines) else ""
-        info["hit"] = {"anchor": "categoria", "line_index": i, "line": ln}
-        info["window"] = [ln, nxt]
-
-        pure = _pure_value(nxt)
-        if pure:
-            info["candidates"] = [pure]
-            info["reason"] = "pure_next_line"
-            return pure, info
-
-        u = _RE_ANCHOR_CATEGORIA.sub(" ", _upper(ln))
-        m2 = _RE_CAT_2.search(u)
-        if m2:
-            cand = m2.group(1).upper()
-            info["candidates"] = [cand]
-            info["reason"] = "inline_combo"
-            return cand, info
-        m1 = _RE_CAT_1.search(u)
-        if m1:
-            cand = m1.group(1).upper()
-            info["candidates"] = [cand]
-            info["reason"] = "inline_single"
-            return cand, info
-
-        info["reason"] = "anchor_found_but_no_candidate"
-        return None, info
-
-    info["reason"] = "anchor_not_found"
-    return None, info
+    return None, dbg
